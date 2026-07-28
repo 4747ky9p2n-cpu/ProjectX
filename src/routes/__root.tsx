@@ -13,7 +13,12 @@ export const Route = createRootRoute({
     meta: [
       { charSet: "utf-8" },
       { name: "viewport", content: "width=device-width, initial-scale=1" },
-      { title: "My site" },
+      { title: "ClipFlow — Viral YT Shorts in Seconds" },
+      {
+        name: "description",
+        content:
+          "ClipFlow analyzes YouTube videos, finds the most viral moments, and creates ready-to-upload Shorts with AI-generated titles — automatically.",
+      },
     ],
     links: [{ rel: "stylesheet", href: appCss }],
   }),
