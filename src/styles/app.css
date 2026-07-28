@@ -3,6 +3,6 @@
 @layer base {
   html,
   body {
-    @apply bg-white text-gray-900 antialiased dark:bg-gray-950 dark:text-gray-100;
+    @apply bg-[#0a0a0a] text-white antialiased;
   }
 }
