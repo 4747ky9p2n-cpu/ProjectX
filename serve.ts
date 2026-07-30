@@ -9,6 +9,12 @@
 // with an already-running server. Every sandbox user has passwordless sudo, so
 // the takeover works across user boundaries.
 import handler from "./dist/server/server.js";
+import {
+  handleAuthInitiate,
+  handleAuthCallback,
+  handleDisconnect,
+  handleChannelInfo,
+} from "./src/lib/oauth-handlers";
 
 // Pinned, NOT read from the environment. The published preview URL
 // (<label>.<PUBLIC_SITE_DOMAIN>) is reverse-proxied to 0.0.0.0:3000 inside the
@@ -41,6 +47,21 @@ for (let attempt = 1; ; attempt++) {
       hostname: HOST,
       async fetch(req) {
         const { pathname } = new URL(req.url);
+
+        // ── OAuth API routes ──
+        if (pathname === "/api/auth/youtube" && req.method === "GET") {
+          return handleAuthInitiate();
+        }
+        if (pathname === "/api/auth/youtube/callback" && req.method === "GET") {
+          return handleAuthCallback(req);
+        }
+        if (pathname === "/api/auth/youtube/disconnect" && req.method === "GET") {
+          return handleDisconnect();
+        }
+        if (pathname === "/api/auth/youtube/channel" && req.method === "GET") {
+          return handleChannelInfo(req);
+        }
+
         if (pathname !== "/") {
           const file = Bun.file(CLIENT_DIR + pathname);
           if (await file.exists()) return new Response(file);

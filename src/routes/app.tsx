@@ -1,6 +1,7 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { createServerFn } from "@tanstack/react-start";
-import { useState } from "react";
+import { useState, useEffect } from "react";
+import type { YouTubeChannel } from "~/lib/youtube-auth";
 
 /* ─────────────────────────────────────────────
    Types
@@ -849,6 +850,12 @@ export const Route = createFileRoute("/app")({
   component: AppPage,
 });
 
+type ConnectionInfo = {
+  connected: boolean;
+  channel?: YouTubeChannel;
+  loading: boolean;
+};
+
 type AppState =
   | { kind: "idle" }
   | { kind: "loading" }
@@ -858,6 +865,45 @@ type AppState =
 function AppPage() {
   const [url, setUrl] = useState("");
   const [state, setState] = useState<AppState>({ kind: "idle" });
+  const [connection, setConnection] = useState<ConnectionInfo>({
+    connected: false,
+    loading: true,
+  });
+
+  // Check connection status on mount
+  useEffect(() => {
+    async function checkConnection() {
+      try {
+        const resp = await fetch("/api/auth/youtube/channel");
+        const result = await resp.json() as { connected: boolean; channel?: YouTubeChannel };
+        setConnection({ connected: result.connected, channel: result.channel, loading: false });
+      } catch {
+        setConnection({ connected: false, loading: false });
+      }
+    }
+    checkConnection();
+  }, []);
+
+  // Check if we just connected via OAuth callback
+  useEffect(() => {
+    if (typeof window !== "undefined") {
+      const params = new URLSearchParams(window.location.search);
+      if (params.get("connected") === "true") {
+        // Re-check connection to get channel info
+        fetch("/api/auth/youtube/channel")
+          .then((r) => r.json())
+          .then((result: { connected: boolean; channel?: YouTubeChannel }) => {
+            setConnection({ connected: result.connected, channel: result.channel, loading: false });
+          });
+        // Clean URL
+        window.history.replaceState({}, "", "/app");
+      }
+      if (params.get("disconnected") === "true") {
+        setConnection({ connected: false, loading: false });
+        window.history.replaceState({}, "", "/app");
+      }
+    }
+  }, []);
 
   async function handleAnalyze(e: React.FormEvent) {
     e.preventDefault();
@@ -875,6 +921,10 @@ function AppPage() {
     }
   }
 
+  function handleDisconnect() {
+    window.location.href = "/api/auth/youtube/disconnect";
+  }
+
   return (
     <div className="min-h-dvh bg-[#0a0a0a] text-white">
       {/* Header */}
@@ -886,14 +936,74 @@ function AppPage() {
           >
             Clip<span className="text-red-500">Flow</span>
           </a>
-          <a
-            href="/"
-            className="text-sm text-gray-400 transition-colors hover:text-white"
-          >
-            ← Back to home
-          </a>
+          <div className="flex items-center gap-4">
+            {/* YouTube Connect Button */}
+            {!connection.loading && (
+              connection.connected ? (
+                <div className="flex items-center gap-3">
+                  {connection.channel && (
+                    <div className="hidden items-center gap-2 sm:flex">
+                      <img
+                        src={connection.channel.thumbnail}
+                        alt=""
+                        className="h-7 w-7 rounded-full"
+                      />
+                      <span className="text-sm text-gray-300 max-w-[140px] truncate">
+                        {connection.channel.title}
+                      </span>
+                    </div>
+                  )}
+                  <span className="hidden sm:inline-flex items-center gap-1 rounded-full bg-green-500/10 px-2.5 py-0.5 text-xs font-medium text-green-400">
+                    <CheckIcon /> Connected
+                  </span>
+                  <button
+                    onClick={handleDisconnect}
+                    className="text-xs text-gray-500 hover:text-red-400 transition-colors"
+                  >
+                    Disconnect
+                  </button>
+                </div>
+              ) : (
+                <a
+                  href="/api/auth/youtube"
+                  className="inline-flex items-center gap-2 rounded-lg bg-[#FF0000] px-4 py-2 text-sm font-semibold text-white transition-all hover:bg-[#E00000] active:scale-95"
+                >
+                  <YouTubeIcon />
+                  Connect YouTube
+                </a>
+              )
+            )}
+            <a
+              href="/"
+              className="text-sm text-gray-400 transition-colors hover:text-white"
+            >
+              ← Back to home
+            </a>
+          </div>
         </div>
       </header>
+
+      {/* Connection Banner */}
+      {connection.connected && connection.channel && (
+        <div className="border-b border-green-500/10 bg-green-500/5 px-6 py-2.5">
+          <div className="mx-auto flex max-w-5xl items-center gap-3 text-sm">
+            <img
+              src={connection.channel.thumbnail}
+              alt=""
+              className="h-6 w-6 rounded-full"
+            />
+            <span className="text-gray-300">
+              Connected as{" "}
+              <span className="font-semibold text-white">
+                {connection.channel.title}
+              </span>
+            </span>
+            <span className="text-gray-600">
+              · {Number(connection.channel.subscriberCount).toLocaleString()} subscribers
+            </span>
+          </div>
+        </div>
+      )}
 
       <main className="mx-auto max-w-5xl px-6 py-12">
         {/* ── Input Section ── */}
@@ -970,6 +1080,7 @@ function AppPage() {
         {state.kind === "success" && (
           <ResultsSection
             result={state.result}
+            isConnected={connection.connected}
             onReset={() => {
               setState({ kind: "idle" });
               setUrl("");
@@ -987,9 +1098,11 @@ function AppPage() {
 
 function ResultsSection({
   result,
+  isConnected,
   onReset,
 }: {
   result: AnalysisResult;
+  isConnected: boolean;
   onReset: () => void;
 }) {
   return (
@@ -1037,7 +1150,7 @@ function ResultsSection({
       </h3>
       <div className="space-y-5">
         {result.clips.map((clip, i) => (
-          <ClipCard key={i} clip={clip} index={i + 1} />
+          <ClipCard key={i} clip={clip} index={i + 1} isConnected={isConnected} />
         ))}
       </div>
     </section>
@@ -1048,7 +1161,7 @@ function ResultsSection({
    Clip Card
    ───────────────────────────────────────────── */
 
-function ClipCard({ clip, index }: { clip: ClipSuggestion; index: number }) {
+function ClipCard({ clip, index, isConnected }: { clip: ClipSuggestion; index: number; isConnected: boolean }) {
   const flames = viralScoreFlames(clip.viralScore);
   const scoreColor = viralScoreColor(clip.viralScore);
 
@@ -1117,6 +1230,26 @@ function ClipCard({ clip, index }: { clip: ClipSuggestion; index: number }) {
               {clip.transcriptSnippet}
             </p>
           </details>
+
+          {/* Upload to YouTube button */}
+          {isConnected ? (
+            <button
+              disabled
+              title="Coming soon — auto-upload will be available in the next update"
+              className="inline-flex items-center gap-2 rounded-lg border border-white/10 bg-white/[0.03] px-4 py-2 text-sm font-medium text-gray-500 cursor-not-allowed transition-all"
+            >
+              <UploadToYouTubeIcon />
+              Upload to YouTube
+              <span className="text-[10px] text-gray-600">Soon</span>
+            </button>
+          ) : (
+            <p className="text-xs text-gray-600">
+              <a href="/api/auth/youtube" className="text-red-400 hover:text-red-300 transition-colors">
+                Connect YouTube
+              </a>{" "}
+              to upload clips directly.
+            </p>
+          )}
         </div>
       </div>
     </div>
@@ -1201,6 +1334,30 @@ function Spinner() {
         fill="currentColor"
         d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"
       />
+    </svg>
+  );
+}
+
+function YouTubeIcon() {
+  return (
+    <svg className="h-5 w-5" viewBox="0 0 24 24" fill="currentColor">
+      <path d="M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z" />
+    </svg>
+  );
+}
+
+function CheckIcon() {
+  return (
+    <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+    </svg>
+  );
+}
+
+function UploadToYouTubeIcon() {
+  return (
+    <svg className="h-4 w-4" viewBox="0 0 24 24" fill="currentColor">
+      <path d="M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z" />
     </svg>
   );
 }
