@@ -1,6 +1,6 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { createServerFn } from "@tanstack/react-start";
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import type { YouTubeChannel } from "~/lib/youtube-auth";
 
 /* ─────────────────────────────────────────────
@@ -28,6 +28,15 @@ interface AnalysisResult {
   videoId: string;
   thumbnailUrl: string;
   clips: ClipSuggestion[];
+}
+
+type UploadStatus = "idle" | "uploading" | "success" | "error";
+
+interface ClipUploadState {
+  status: UploadStatus;
+  videoUrl?: string;
+  videoId?: string;
+  errorMessage?: string;
 }
 
 /* ─────────────────────────────────────────────
@@ -1105,6 +1114,90 @@ function ResultsSection({
   isConnected: boolean;
   onReset: () => void;
 }) {
+  // Per-clip upload states — initialized to idle
+  const [uploadStates, setUploadStates] = useState<ClipUploadState[]>(
+    () => result.clips.map(() => ({ status: "idle" }))
+  );
+
+  const handleUpload = useCallback(
+    async (clipIndex: number) => {
+      const clip = result.clips[clipIndex];
+      if (!clip) return;
+
+      // Set this clip to uploading
+      setUploadStates((prev) => {
+        const next = [...prev];
+        next[clipIndex] = { status: "uploading" };
+        return next;
+      });
+
+      try {
+        const resp = await fetch("/api/upload/clip", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            clipIndex,
+            videoUrl: `https://www.youtube.com/watch?v=${result.videoId}`,
+            startTime: clip.startTime,
+            endTime: clip.endTime,
+            title: clip.title,
+            description: clip.description,
+          }),
+        });
+
+        const data = (await resp.json()) as {
+          success: boolean;
+          videoId?: string;
+          videoUrl?: string;
+          error?: string;
+        };
+
+        if (data.success && data.videoUrl) {
+          setUploadStates((prev) => {
+            const next = [...prev];
+            next[clipIndex] = {
+              status: "success",
+              videoUrl: data.videoUrl,
+              videoId: data.videoId,
+            };
+            return next;
+          });
+        } else {
+          setUploadStates((prev) => {
+            const next = [...prev];
+            next[clipIndex] = {
+              status: "error",
+              errorMessage: data.error || "Upload failed. Try again.",
+            };
+            return next;
+          });
+        }
+      } catch (err) {
+        setUploadStates((prev) => {
+          const next = [...prev];
+          next[clipIndex] = {
+            status: "error",
+            errorMessage:
+              err instanceof Error ? err.message : "Network error. Check your connection.",
+          };
+          return next;
+        });
+      }
+    },
+    [result.clips, result.videoId]
+  );
+
+  const handleRetry = useCallback(
+    (clipIndex: number) => {
+      setUploadStates((prev) => {
+        const next = [...prev];
+        next[clipIndex] = { status: "idle" };
+        return next;
+      });
+    },
+    []
+  );
+
   return (
     <section>
       {/* Video info header */}
@@ -1114,7 +1207,6 @@ function ResultsSection({
           alt={result.videoTitle}
           className="h-40 w-72 shrink-0 rounded-xl border border-white/5 object-cover"
           onError={(e) => {
-            // Fallback to hqdefault if maxresdefault fails
             const img = e.target as HTMLImageElement;
             if (!img.src.includes("hqdefault")) {
               img.src = `https://img.youtube.com/vi/${result.videoId}/hqdefault.jpg`;
@@ -1150,7 +1242,15 @@ function ResultsSection({
       </h3>
       <div className="space-y-5">
         {result.clips.map((clip, i) => (
-          <ClipCard key={i} clip={clip} index={i + 1} isConnected={isConnected} />
+          <ClipCard
+            key={i}
+            clip={clip}
+            index={i + 1}
+            isConnected={isConnected}
+            uploadState={uploadStates[i] || { status: "idle" }}
+            onUpload={() => handleUpload(i)}
+            onRetry={() => handleRetry(i)}
+          />
         ))}
       </div>
     </section>
@@ -1161,7 +1261,21 @@ function ResultsSection({
    Clip Card
    ───────────────────────────────────────────── */
 
-function ClipCard({ clip, index, isConnected }: { clip: ClipSuggestion; index: number; isConnected: boolean }) {
+function ClipCard({
+  clip,
+  index,
+  isConnected,
+  uploadState,
+  onUpload,
+  onRetry,
+}: {
+  clip: ClipSuggestion;
+  index: number;
+  isConnected: boolean;
+  uploadState: ClipUploadState;
+  onUpload: () => void;
+  onRetry: () => void;
+}) {
   const flames = viralScoreFlames(clip.viralScore);
   const scoreColor = viralScoreColor(clip.viralScore);
 
@@ -1233,18 +1347,17 @@ function ClipCard({ clip, index, isConnected }: { clip: ClipSuggestion; index: n
 
           {/* Upload to YouTube button */}
           {isConnected ? (
-            <button
-              disabled
-              title="Coming soon — auto-upload will be available in the next update"
-              className="inline-flex items-center gap-2 rounded-lg border border-white/10 bg-white/[0.03] px-4 py-2 text-sm font-medium text-gray-500 cursor-not-allowed transition-all"
-            >
-              <UploadToYouTubeIcon />
-              Upload to YouTube
-              <span className="text-[10px] text-gray-600">Soon</span>
-            </button>
+            <UploadButton
+              uploadState={uploadState}
+              onUpload={onUpload}
+              onRetry={onRetry}
+            />
           ) : (
             <p className="text-xs text-gray-600">
-              <a href="/api/auth/youtube" className="text-red-400 hover:text-red-300 transition-colors">
+              <a
+                href="/api/auth/youtube"
+                className="text-red-400 hover:text-red-300 transition-colors"
+              >
                 Connect YouTube
               </a>{" "}
               to upload clips directly.
@@ -1253,6 +1366,84 @@ function ClipCard({ clip, index, isConnected }: { clip: ClipSuggestion; index: n
         </div>
       </div>
     </div>
+  );
+}
+
+/* ─────────────────────────────────────────────
+   Upload Button
+   ───────────────────────────────────────────── */
+
+function UploadButton({
+  uploadState,
+  onUpload,
+  onRetry,
+}: {
+  uploadState: ClipUploadState;
+  onUpload: () => void;
+  onRetry: () => void;
+}) {
+  const { status, videoUrl, errorMessage } = uploadState;
+
+  if (status === "success" && videoUrl) {
+    return (
+      <div className="flex flex-wrap items-center gap-3">
+        <span className="inline-flex items-center gap-1.5 rounded-lg bg-green-500/10 px-3 py-2 text-sm font-medium text-green-400">
+          <CheckIconSolid />
+          Uploaded!
+        </span>
+        <a
+          href={videoUrl}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="inline-flex items-center gap-1.5 rounded-lg bg-white/[0.06] px-3 py-2 text-sm font-medium text-white transition-all hover:bg-white/[0.12]"
+        >
+          <LinkIcon />
+          View on YouTube
+        </a>
+      </div>
+    );
+  }
+
+  if (status === "uploading") {
+    return (
+      <button
+        disabled
+        className="inline-flex items-center gap-2 rounded-lg border border-red-500/30 bg-red-500/5 px-4 py-2 text-sm font-medium text-red-400 cursor-wait"
+      >
+        <Spinner />
+        Uploading...
+      </button>
+    );
+  }
+
+  if (status === "error") {
+    return (
+      <div className="space-y-2">
+        <div className="flex flex-wrap items-center gap-3">
+          <button
+            onClick={onRetry}
+            className="inline-flex items-center gap-2 rounded-lg border border-red-500/50 bg-red-500/10 px-4 py-2 text-sm font-medium text-red-400 transition-all hover:bg-red-500/20 hover:text-red-300 active:scale-95"
+          >
+            <RetryIcon />
+            Retry Upload
+          </button>
+        </div>
+        {errorMessage && (
+          <p className="text-xs text-red-400/70 max-w-md">{errorMessage}</p>
+        )}
+      </div>
+    );
+  }
+
+  // idle
+  return (
+    <button
+      onClick={onUpload}
+      className="inline-flex items-center gap-2 rounded-lg border border-white/10 bg-white/[0.05] px-4 py-2 text-sm font-medium text-white transition-all hover:border-red-500/30 hover:bg-red-500/10 hover:text-red-400 active:scale-95"
+    >
+      <UploadToYouTubeIcon />
+      Upload to YouTube
+    </button>
   );
 }
 
@@ -1358,6 +1549,42 @@ function UploadToYouTubeIcon() {
   return (
     <svg className="h-4 w-4" viewBox="0 0 24 24" fill="currentColor">
       <path d="M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z" />
+    </svg>
+  );
+}
+
+function CheckIconSolid() {
+  return (
+    <svg className="h-4 w-4" viewBox="0 0 24 24" fill="currentColor">
+      <path
+        fillRule="evenodd"
+        d="M2.25 12c0-5.385 4.365-9.75 9.75-9.75s9.75 4.365 9.75 9.75-4.365 9.75-9.75 9.75S2.25 17.385 2.25 12zm13.36-1.814a.75.75 0 10-1.22-.872l-3.236 4.53L9.53 12.22a.75.75 0 00-1.06 1.06l2.25 2.25a.75.75 0 001.14-.094l3.75-5.25z"
+        clipRule="evenodd"
+      />
+    </svg>
+  );
+}
+
+function LinkIcon() {
+  return (
+    <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+      <path
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        d="M13.5 6H5.25A2.25 2.25 0 003 8.25v10.5A2.25 2.25 0 005.25 21h10.5A2.25 2.25 0 0018 18.75V10.5m-10.5 6L21 3m0 0h-5.25M21 3v5.25"
+      />
+    </svg>
+  );
+}
+
+function RetryIcon() {
+  return (
+    <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+      <path
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0l3.181 3.183a8.25 8.25 0 0013.803-3.7M4.031 9.865a8.25 8.25 0 0113.803-3.7l3.181 3.182"
+      />
     </svg>
   );
 }
