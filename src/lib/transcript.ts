@@ -1,8 +1,3 @@
-import { spawn } from "node:child_process";
-import { readFile, unlink, readdir } from "node:fs/promises";
-import * as path from "node:path";
-import * as os from "node:os";
-
 /* ─────────────────────────────────────────────
    Types
    ───────────────────────────────────────────── */
@@ -17,101 +12,185 @@ export interface TranscriptSegment {
    Main entry point — multi-strategy transcript fetch
    ───────────────────────────────────────────── */
 
+const SUPADATA_API_KEY = "sd_f8518e4e6943014d9d87d2012fa004a6";
+
+/**
+ * yt-dlp fallback is DISABLED: YouTube blocks this datacenter IP with bot
+ * detection, so the strategy always fails after a ~45s timeout — pure waste.
+ * Flip to true to re-enable if the hosting environment stops being blocked.
+ */
+const ENABLE_YT_DLP_FALLBACK = false;
+
 /**
  * Fetch transcript for a YouTube video using the best available strategy.
- * Tries yt-dlp first (most reliable for auto-generated captions across languages),
- * then falls back to youtranscript.com and finally YouTube page scraping.
+ * Uses Supadata API as primary (works from any IP, with timeout + retry),
+ * followed by YouTube page scraping as a last resort.
  */
 export async function fetchTranscript(
   videoId: string
 ): Promise<TranscriptSegment[]> {
-  // Strategy 1: yt-dlp with android client (best for auto-generated captions)
+  let sawNoCaptions = false;
+
+  // Strategy 1: Supadata API (primary — works from datacenter IPs)
   try {
-    return await fetchViaYtDlp(videoId, true);
+    return await fetchViaSupadata(videoId);
   } catch (err) {
-    console.log("[transcript] yt-dlp android failed:", (err as Error).message);
+    const msg = (err as Error).message;
+    console.log("[transcript] Supadata failed:", msg);
+    if (isNoCaptionsError(msg)) sawNoCaptions = true;
   }
 
-  // Strategy 2: yt-dlp with default client
-  try {
-    return await fetchViaYtDlp(videoId, false);
-  } catch (err) {
-    console.log("[transcript] yt-dlp default failed:", (err as Error).message);
+  // Strategy 2: yt-dlp (disabled — see ENABLE_YT_DLP_FALLBACK above)
+  if (ENABLE_YT_DLP_FALLBACK) {
+    try {
+      return await fetchViaYtDlp(videoId, true);
+    } catch (err) {
+      console.log("[transcript] yt-dlp android failed:", (err as Error).message);
+    }
   }
 
-  // Strategy 3: youtranscript.com API (lightweight HTTP API)
+  // Strategy 3: YouTube page scraping (last resort)
   try {
-    return await fetchViaYouTranscript(videoId);
+    return await fetchViaYouTubePage(videoId);
   } catch (err) {
-    console.log("[transcript] youtranscript failed:", (err as Error).message);
+    const msg = (err as Error).message;
+    console.log("[transcript] page scraping failed:", msg);
+    if (isNoCaptionsError(msg)) sawNoCaptions = true;
   }
 
-  // Strategy 4: YouTube page scraping (last resort, fragile)
-  return await fetchViaYouTubePage(videoId);
+  // Distinguish "video has no captions" from "service is down" so the UI
+  // can show a useful message instead of a raw API error.
+  if (sawNoCaptions) {
+    throw new Error("No transcript available — this video has no captions.");
+  }
+  throw new Error(
+    "Transcript service temporarily unavailable. Please try again in a moment."
+  );
+}
+
+/** Heuristic: does this error mean the video simply has no usable captions? */
+function isNoCaptionsError(msg: string): boolean {
+  const lower = msg.toLowerCase();
+  return (
+    lower.includes("no captions") ||
+    lower.includes("no transcript") ||
+    lower.includes("captions are disabled") ||
+    lower.includes("empty transcript") ||
+    lower.includes("404")
+  );
 }
 
 /* ─────────────────────────────────────────────
-   Strategy 1 & 2: yt-dlp subtitle extraction
+   Strategy 1: Supadata API (primary)
    ───────────────────────────────────────────── */
 
-/**
- * Language fallback chain for subtitle selection.
- * Try one language at a time to avoid rate limiting.
- * English variants first, then common languages, then catch-all.
- */
-const SUB_LANG_ATTEMPTS = [
-  "en",
-  "en-US",
-  "en-GB",
-  "de",
-  "fr",
-  "es",
-  ".*", // catch-all for any available language
-];
+interface SupadataChunk {
+  text: string;
+  start: number;
+  duration: number;
+}
+
+interface SupadataResponse {
+  content: SupadataChunk[] | string;
+  lang: string;
+  availableLanguages?: { lang: string; name: string }[];
+}
+
+async function fetchViaSupadata(
+  videoId: string
+): Promise<TranscriptSegment[]> {
+  const url = `https://www.youtube.com/watch?v=${videoId}`;
+  const apiUrl = `https://api.supadata.ai/v1/youtube/transcript?url=${encodeURIComponent(url)}&text=false`;
+
+  const MAX_ATTEMPTS = 2;
+  const RETRY_DELAY_MS = 1000;
+  const TIMEOUT_MS = 30_000;
+
+  let lastError: Error | null = null;
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    if (attempt > 1) {
+      // Wait 1s before retrying (single retry on any transient failure)
+      await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
+    }
+
+    try {
+      const resp = await fetch(apiUrl, {
+        headers: { "x-api-key": SUPADATA_API_KEY },
+        signal: AbortSignal.timeout(TIMEOUT_MS),
+      });
+
+      if (!resp.ok) {
+        const body = await resp.text().catch(() => "");
+        lastError = new Error(
+          `Supadata API returned ${resp.status}: ${body.slice(0, 200)}`
+        );
+        // Retry transient server errors (429/5xx); deterministic 4xx
+        // (e.g. 404 = no captions) won't get better on retry.
+        if (resp.status === 429 || resp.status >= 500) {
+          console.log(
+            `[transcript] Supadata attempt ${attempt}/${MAX_ATTEMPTS} failed (HTTP ${resp.status}); retrying...`
+          );
+          continue;
+        }
+        break;
+      }
+
+      const data = (await resp.json()) as SupadataResponse;
+
+      // Handle plain text response (when text=true is used as fallback)
+      if (typeof data.content === "string") {
+        const text = data.content.trim();
+        if (!text) throw new Error("Supadata returned empty transcript.");
+        // Create a single segment from the full text
+        return [{ text, start: 0, duration: 60 }];
+      }
+
+      // Handle chunked response (text=false)
+      if (!Array.isArray(data.content) || data.content.length === 0) {
+        throw new Error("Supadata returned empty transcript.");
+      }
+
+      return data.content.map((chunk: any) => ({
+        text: (chunk.text || "").trim(),
+        // Supadata uses 'offset' (in ms) and 'duration' (in ms)
+        start: Math.round(((chunk.offset ?? chunk.start ?? 0) / 1000) * 100) / 100,
+        duration: Math.round(((chunk.duration || 1000) / 1000) * 100) / 100,
+      })).filter((seg: TranscriptSegment) => seg.text.length > 0);
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+      console.log(
+        `[transcript] Supadata attempt ${attempt}/${MAX_ATTEMPTS} failed: ${lastError.message}`
+      );
+      // Network error or timeout — try once more.
+    }
+  }
+
+  throw lastError ?? new Error("Supadata request failed.");
+}
+
+/* ─────────────────────────────────────────────
+   Strategy 2: yt-dlp (fallback)
+   ───────────────────────────────────────────── */
+
+import { spawn } from "node:child_process";
+import { readFile, unlink, readdir } from "node:fs/promises";
+import * as path from "node:path";
+import * as os from "node:os";
 
 async function fetchViaYtDlp(
   videoId: string,
   useAndroid: boolean
 ): Promise<TranscriptSegment[]> {
   const url = `https://www.youtube.com/watch?v=${videoId}`;
-
-  // Try each language one at a time to avoid rate limits
-  for (const lang of SUB_LANG_ATTEMPTS) {
-    try {
-      return await tryYtDlpWithLang(videoId, url, lang, useAndroid);
-    } catch (err) {
-      // If this was a genuine "no captions" error, skip to next language
-      const msg = (err as Error).message;
-      if (msg.includes("No captions") || msg.includes("has no subtitles")) {
-        continue;
-      }
-      // For rate limits and other transient errors, also try next
-      if (msg.includes("429") || msg.includes("Too Many Requests")) {
-        // Add a small delay before retrying
-        await new Promise((r) => setTimeout(r, 1000));
-        continue;
-      }
-      // For other errors, re-throw to let the caller try next strategy
-      throw err;
-    }
-  }
-
-  throw new Error("No captions available for this video in any language.");
-}
-
-async function tryYtDlpWithLang(
-  videoId: string,
-  url: string,
-  lang: string,
-  useAndroid: boolean
-): Promise<TranscriptSegment[]> {
+  const lang = "en";
   const tmpDir = os.tmpdir();
   const outputBase = path.join(tmpDir, `clipflow_${videoId}`);
 
   const args = [
     "--skip-download",
-    "--write-auto-subs",       // auto-generated captions
-    "--write-subs",            // manual captions too
+    "--write-auto-subs",
+    "--write-subs",
     "--sub-format", "srt",
     "--sub-lang", lang,
     "-o", outputBase,
@@ -127,13 +206,9 @@ async function tryYtDlpWithLang(
   const { exitCode, stderr } = await spawnYtDlp(args);
 
   if (exitCode !== 0) {
-    if (stderr.includes("no captions") || stderr.includes("has no subtitles")) {
-      throw new Error("No captions available for this video.");
-    }
     throw new Error(`yt-dlp exited with code ${exitCode}: ${stderr.slice(-200)}`);
   }
 
-  // Find the generated SRT file
   const srtPath = await findSrtFile(outputBase, tmpDir, videoId);
   if (!srtPath) {
     throw new Error("No subtitle file was generated by yt-dlp.");
@@ -141,7 +216,6 @@ async function tryYtDlpWithLang(
 
   const content = await readFile(srtPath, "utf-8");
 
-  // Clean up temp files
   await unlink(srtPath).catch(() => {});
   const tmpFiles = await readdir(tmpDir);
   for (const f of tmpFiles) {
@@ -150,9 +224,7 @@ async function tryYtDlpWithLang(
     }
   }
 
-  if (!content || content.trim().length === 0) {
-    throw new Error("Subtitle file is empty.");
-  }
+  if (!content?.trim()) throw new Error("Subtitle file is empty.");
 
   const segments = parseSrt(content);
   if (segments.length === 0) {
@@ -162,71 +234,33 @@ async function tryYtDlpWithLang(
   return segments;
 }
 
-/**
- * Spawn yt-dlp as a child process and collect results.
- */
 function spawnYtDlp(
   args: string[]
 ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
   return new Promise((resolve, reject) => {
     const proc = spawn("yt-dlp", args, {
       stdio: ["ignore", "pipe", "pipe"],
-      timeout: 45_000, // 45 second timeout
+      timeout: 45_000,
     });
-
     let stdout = "";
     let stderr = "";
-
-    proc.stdout.on("data", (data: Buffer) => {
-      stdout += data.toString();
-    });
-
-    proc.stderr.on("data", (data: Buffer) => {
-      stderr += data.toString();
-    });
-
-    proc.on("error", (err) => {
-      reject(new Error(`Failed to spawn yt-dlp: ${err.message}`));
-    });
-
-    proc.on("close", (code) => {
-      resolve({
-        stdout,
-        stderr,
-        exitCode: code ?? -1,
-      });
-    });
+    proc.stdout.on("data", (d: Buffer) => { stdout += d.toString(); });
+    proc.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
+    proc.on("error", (err) => reject(new Error(`Failed to spawn yt-dlp: ${err.message}`)));
+    proc.on("close", (code) => resolve({ stdout, stderr, exitCode: code ?? -1 }));
   });
 }
 
-/**
- * Find the SRT file generated by yt-dlp for a given video.
- * yt-dlp names output like: clipflow_VIDEOID.LANG.srt
- */
 async function findSrtFile(
   outputBase: string,
   tmpDir: string,
   videoId: string
 ): Promise<string | null> {
-  // First, try the direct path pattern yt-dlp uses
-  // yt-dlp appends the subtitle language code before .srt
   const tmpFiles = await readdir(tmpDir);
-
-  // Look for files matching: clipflow_<videoId>.*.srt
   const srtFiles = tmpFiles
     .filter((f) => f.startsWith(`clipflow_${videoId}`) && f.endsWith(".srt"))
-    .sort((a, b) => {
-      // Prefer English
-      const aEn = a.includes(".en") ? 0 : 1;
-      const bEn = b.includes(".en") ? 0 : 1;
-      return aEn - bEn;
-    });
-
-  if (srtFiles.length > 0) {
-    return path.join(tmpDir, srtFiles[0]);
-  }
-
-  return null;
+    .sort((a, b) => (a.includes(".en") ? -1 : b.includes(".en") ? 1 : 0));
+  return srtFiles.length > 0 ? path.join(tmpDir, srtFiles[0]) : null;
 }
 
 /* ─────────────────────────────────────────────
@@ -342,37 +376,7 @@ function parseSrt(content: string): TranscriptSegment[] {
 }
 
 /* ─────────────────────────────────────────────
-   Strategy 3: youtranscript.com API
-   ───────────────────────────────────────────── */
-
-async function fetchViaYouTranscript(
-  videoId: string
-): Promise<TranscriptSegment[]> {
-  const resp = await fetch(
-    `https://youtranscript.com/api/transcript?videoId=${videoId}`,
-    { signal: AbortSignal.timeout(8_000) }
-  );
-
-  if (!resp.ok) {
-    throw new Error(`youtranscript returned ${resp.status}`);
-  }
-
-  const data = (await resp.json()) as Record<string, unknown>;
-
-  if (!Array.isArray(data.transcript) || data.transcript.length === 0) {
-    throw new Error("youtranscript returned empty transcript");
-  }
-
-  const segs = data.transcript as Array<Record<string, unknown>>;
-  return segs.map((seg) => ({
-    text: typeof seg.text === "string" ? seg.text : "",
-    start: typeof seg.offset === "number" ? seg.offset : 0,
-    duration: typeof seg.duration === "number" ? seg.duration : 1,
-  }));
-}
-
-/* ─────────────────────────────────────────────
-   Strategy 4: YouTube page scraping (last resort)
+   Strategy 3: YouTube page scraping (last resort)
    ───────────────────────────────────────────── */
 
 async function fetchViaYouTubePage(
