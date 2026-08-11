@@ -373,7 +373,10 @@ async function fetchSupadataDownload(videoUrl: string): Promise<
     // { "error": "...", "message": "...", "details": "...", "documentationUrl": "..." }
     let parsed: { error?: string; message?: string; details?: string } | null = null;
     try {
-      parsed = JSON.parse(bodyText) as typeof parsed;
+      const raw = JSON.parse(bodyText);
+      if (raw && typeof raw === "object") {
+        parsed = raw as { error?: string; message?: string; details?: string };
+      }
     } catch {
       parsed = null;
     }
