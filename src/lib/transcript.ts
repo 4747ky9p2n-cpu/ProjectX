@@ -15,37 +15,68 @@ export interface TranscriptSegment {
 const SUPADATA_API_KEY = "sd_f8518e4e6943014d9d87d2012fa004a6";
 
 /**
+ * yt-dlp fallback is DISABLED: YouTube blocks this datacenter IP with bot
+ * detection, so the strategy always fails after a ~45s timeout — pure waste.
+ * Flip to true to re-enable if the hosting environment stops being blocked.
+ */
+const ENABLE_YT_DLP_FALLBACK = false;
+
+/**
  * Fetch transcript for a YouTube video using the best available strategy.
- * Uses Supadata API as primary (works from any IP), with yt-dlp and
- * YouTube page scraping as fallbacks.
+ * Uses Supadata API as primary (works from any IP, with timeout + retry),
+ * followed by YouTube page scraping as a last resort.
  */
 export async function fetchTranscript(
   videoId: string
 ): Promise<TranscriptSegment[]> {
+  let sawNoCaptions = false;
+
   // Strategy 1: Supadata API (primary — works from datacenter IPs)
   try {
     return await fetchViaSupadata(videoId);
   } catch (err) {
-    console.log("[transcript] Supadata failed:", (err as Error).message);
+    const msg = (err as Error).message;
+    console.log("[transcript] Supadata failed:", msg);
+    if (isNoCaptionsError(msg)) sawNoCaptions = true;
   }
 
-  // Strategy 2: yt-dlp (fallback if Supadata is unavailable)
-  try {
-    return await fetchViaYtDlp(videoId, true);
-  } catch (err) {
-    console.log("[transcript] yt-dlp android failed:", (err as Error).message);
+  // Strategy 2: yt-dlp (disabled — see ENABLE_YT_DLP_FALLBACK above)
+  if (ENABLE_YT_DLP_FALLBACK) {
+    try {
+      return await fetchViaYtDlp(videoId, true);
+    } catch (err) {
+      console.log("[transcript] yt-dlp android failed:", (err as Error).message);
+    }
   }
 
   // Strategy 3: YouTube page scraping (last resort)
   try {
     return await fetchViaYouTubePage(videoId);
   } catch (err) {
-    console.log("[transcript] page scraping failed:", (err as Error).message);
+    const msg = (err as Error).message;
+    console.log("[transcript] page scraping failed:", msg);
+    if (isNoCaptionsError(msg)) sawNoCaptions = true;
   }
 
+  // Distinguish "video has no captions" from "service is down" so the UI
+  // can show a useful message instead of a raw API error.
+  if (sawNoCaptions) {
+    throw new Error("No transcript available — this video has no captions.");
+  }
   throw new Error(
-    "Could not extract transcript. The video may not have captions enabled, " +
-    "or the transcript service is temporarily unavailable. Try again later."
+    "Transcript service temporarily unavailable. Please try again in a moment."
+  );
+}
+
+/** Heuristic: does this error mean the video simply has no usable captions? */
+function isNoCaptionsError(msg: string): boolean {
+  const lower = msg.toLowerCase();
+  return (
+    lower.includes("no captions") ||
+    lower.includes("no transcript") ||
+    lower.includes("captions are disabled") ||
+    lower.includes("empty transcript") ||
+    lower.includes("404")
   );
 }
 
@@ -71,37 +102,71 @@ async function fetchViaSupadata(
   const url = `https://www.youtube.com/watch?v=${videoId}`;
   const apiUrl = `https://api.supadata.ai/v1/youtube/transcript?url=${encodeURIComponent(url)}&text=false`;
 
-  const resp = await fetch(apiUrl, {
-    headers: { "x-api-key": SUPADATA_API_KEY },
-    signal: AbortSignal.timeout(20_000),
-  });
+  const MAX_ATTEMPTS = 2;
+  const RETRY_DELAY_MS = 1000;
+  const TIMEOUT_MS = 30_000;
 
-  if (!resp.ok) {
-    const body = await resp.text().catch(() => "");
-    throw new Error(`Supadata API returned ${resp.status}: ${body.slice(0, 200)}`);
+  let lastError: Error | null = null;
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    if (attempt > 1) {
+      // Wait 1s before retrying (single retry on any transient failure)
+      await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
+    }
+
+    try {
+      const resp = await fetch(apiUrl, {
+        headers: { "x-api-key": SUPADATA_API_KEY },
+        signal: AbortSignal.timeout(TIMEOUT_MS),
+      });
+
+      if (!resp.ok) {
+        const body = await resp.text().catch(() => "");
+        lastError = new Error(
+          `Supadata API returned ${resp.status}: ${body.slice(0, 200)}`
+        );
+        // Retry transient server errors (429/5xx); deterministic 4xx
+        // (e.g. 404 = no captions) won't get better on retry.
+        if (resp.status === 429 || resp.status >= 500) {
+          console.log(
+            `[transcript] Supadata attempt ${attempt}/${MAX_ATTEMPTS} failed (HTTP ${resp.status}); retrying...`
+          );
+          continue;
+        }
+        break;
+      }
+
+      const data = (await resp.json()) as SupadataResponse;
+
+      // Handle plain text response (when text=true is used as fallback)
+      if (typeof data.content === "string") {
+        const text = data.content.trim();
+        if (!text) throw new Error("Supadata returned empty transcript.");
+        // Create a single segment from the full text
+        return [{ text, start: 0, duration: 60 }];
+      }
+
+      // Handle chunked response (text=false)
+      if (!Array.isArray(data.content) || data.content.length === 0) {
+        throw new Error("Supadata returned empty transcript.");
+      }
+
+      return data.content.map((chunk: any) => ({
+        text: (chunk.text || "").trim(),
+        // Supadata uses 'offset' (in ms) and 'duration' (in ms)
+        start: Math.round(((chunk.offset ?? chunk.start ?? 0) / 1000) * 100) / 100,
+        duration: Math.round(((chunk.duration || 1000) / 1000) * 100) / 100,
+      })).filter((seg: TranscriptSegment) => seg.text.length > 0);
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+      console.log(
+        `[transcript] Supadata attempt ${attempt}/${MAX_ATTEMPTS} failed: ${lastError.message}`
+      );
+      // Network error or timeout — try once more.
+    }
   }
 
-  const data = (await resp.json()) as SupadataResponse;
-
-  // Handle plain text response (when text=true is used as fallback)
-  if (typeof data.content === "string") {
-    const text = data.content.trim();
-    if (!text) throw new Error("Supadata returned empty transcript.");
-    // Create a single segment from the full text
-    return [{ text, start: 0, duration: 60 }];
-  }
-
-  // Handle chunked response (text=false)
-  if (!Array.isArray(data.content) || data.content.length === 0) {
-    throw new Error("Supadata returned empty transcript.");
-  }
-
-  return data.content.map((chunk: any) => ({
-    text: (chunk.text || "").trim(),
-    // Supadata uses 'offset' (in ms) and 'duration' (in ms)
-    start: Math.round(((chunk.offset ?? chunk.start ?? 0) / 1000) * 100) / 100,
-    duration: Math.round(((chunk.duration || 1000) / 1000) * 100) / 100,
-  })).filter((seg: TranscriptSegment) => seg.text.length > 0);
+  throw lastError ?? new Error("Supadata request failed.");
 }
 
 /* ─────────────────────────────────────────────

@@ -66,7 +66,11 @@ const analyzeVideo = createServerFn({ method: "POST" })
       if (msg.includes("No captions") || msg.includes("No transcript")) {
         throw new Error("No transcript available — this video has no captions.");
       }
-      throw new Error(msg);
+      // Any other failure (timeout, network blip, upstream API error) is
+      // transient — surface a clean message, not a raw API error.
+      throw new Error(
+        "Transcript service temporarily unavailable. Please try again in a moment."
+      );
     }
 
     if (!segments || segments.length < 5) {
@@ -141,14 +145,15 @@ async function fetchVideoMetadata(
   try {
     const resp = await fetch(
       `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`,
-      { signal: AbortSignal.timeout(5000) }
+      { signal: AbortSignal.timeout(15_000) }
     );
     if (resp.ok) {
       const data = (await resp.json()) as { title?: string };
       return { title: data.title || "Untitled Video" };
     }
   } catch {
-    // fallback
+    // oEmbed is best-effort — fall back to a generic title so the analysis
+    // still returns results even if YouTube is slow or blocks the request.
   }
   return { title: "YouTube Video" };
 }
