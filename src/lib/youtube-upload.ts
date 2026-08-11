@@ -235,10 +235,16 @@ async function uploadToYouTubeAPI(
   const fileBytes = await file.arrayBuffer();
   const fileBuffer = Buffer.from(fileBytes);
 
-  // Truncate title to 100 chars (YouTube limit)
-  const safeTitle = title.slice(0, 100);
+  // Sanitize metadata BEFORE truncation so we never split a surrogate pair
+  // (a lone surrogate makes JSON.stringify emit \uD83D-style escapes, which
+  // Google rejects with "The string did not match the expected pattern").
+  const safeTitle = truncateToCodePoints(sanitizeTitle(title), 100);
+  const safeDescription = truncateToCodePoints(
+    stripLoneSurrogates(description),
+    5000
+  );
 
-  // Extract tags from hashtags in description
+  // Extract + sanitize tags from hashtags in description
   const tags = extractTags(description);
 
   // YouTube's resumable upload URL
@@ -249,7 +255,7 @@ async function uploadToYouTubeAPI(
   const metadata = {
     snippet: {
       title: safeTitle,
-      description: description.slice(0, 5000), // YouTube limit
+      description: safeDescription,
       tags,
       categoryId: "22", // People & Blogs
     },
@@ -277,7 +283,7 @@ async function uploadToYouTubeAPI(
       return {
         success: false,
         code: "UPLOAD_FAILED",
-        error: `YouTube rejected the upload: ${initResp.status} ${initResp.statusText}`,
+        error: `YouTube rejected the upload (${initResp.status}): ${parseGoogleError(errText)}`,
       };
     }
 
@@ -307,7 +313,7 @@ async function uploadToYouTubeAPI(
       return {
         success: false,
         code: "UPLOAD_FAILED",
-        error: `Failed to upload video: ${uploadResp.status}`,
+        error: `Failed to upload video (${uploadResp.status}): ${parseGoogleError(errText)}`,
       };
     }
 
@@ -335,20 +341,111 @@ async function uploadToYouTubeAPI(
 }
 
 /* ─────────────────────────────────────────────
-   Helpers
+   Metadata Sanitization
    ───────────────────────────────────────────── */
+
+/**
+ * Strip anything the YouTube Data API rejects in a snippet.title:
+ * emojis, variation selectors, control/format chars, replacement
+ * characters and unpaired surrogates. Keeps letters, digits and
+ * punctuation (incl. non-ASCII letters like ä/é/ß).
+ */
+function sanitizeTitle(title: string): string {
+  return stripLoneSurrogates(title)
+    .replace(/\p{Extended_Pictographic}/gu, "") // emoji pictographs (🤯🔥💡…)
+    .replace(/[\uFE00-\uFE0F\u{E0100}-\u{E01EF}]/gu, "") // variation selectors (emoji style)
+    .replace(/\p{Cc}/gu, "") // control characters
+    .replace(/\p{Cf}/gu, "") // format characters (ZWJ, bidi, soft hyphen…)
+    .replace(/[\uFFFD\uFFFE\uFFFF]/gu, "") // replacement char + noncharacters
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/** Remove unpaired surrogate halves that break JSON/API string validation. */
+function stripLoneSurrogates(s: string): string {
+  // eslint-disable-next-line no-misleading-character-class
+  return s.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/gu, "").replace(
+    /(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/gu,
+    ""
+  );
+}
+
+/** Truncate by Unicode code points so we never split a surrogate pair. */
+function truncateToCodePoints(s: string, max: number): string {
+  if (s.length <= max) return s;
+  return Array.from(s).slice(0, max).join("");
+}
+
+/** Keep only [a-zA-Z0-9_-], lowercase, max 30 chars (YouTube tag rules). */
+function sanitizeTag(raw: string): string {
+  return raw.replace(/[^a-zA-Z0-9_-]/g, "").toLowerCase().slice(0, 30);
+}
 
 /** Extract YouTube-compatible tags from description hashtags. */
 function extractTags(description: string): string[] {
-  const tagRegex = /#(\w+)/g;
+  const tagRegex = /#([^\s#]+)/g;
+  const seen = new Set<string>();
   const tags: string[] = [];
   let match: RegExpExecArray | null;
   while ((match = tagRegex.exec(description)) !== null) {
-    const tag = match[1];
-    // YouTube: max 30 chars per tag, lowercase, no spaces
-    if (tag.length <= 30 && !tags.includes(tag)) {
+    const tag = sanitizeTag(match[1]);
+    // Drop empty results and dedupe
+    if (tag && !seen.has(tag)) {
+      seen.add(tag);
       tags.push(tag);
     }
+    // YouTube allows max ~30 tags
+    if (tags.length >= 30) break;
   }
-  return tags.slice(0, 30); // YouTube allows max ~30 tags
+  return tags;
+}
+
+/* ─────────────────────────────────────────────
+   Google API Error Parsing
+   ───────────────────────────────────────────── */
+
+interface GoogleApiErrorBody {
+  error?: {
+    code?: number;
+    message?: string;
+    errors?: Array<{
+      message?: string;
+      domain?: string;
+      reason?: string;
+      location?: string;
+      locationType?: string;
+    }>;
+  };
+}
+
+/**
+ * Parse a Google API error response body and return a human-readable
+ * string with the real reason, e.g.:
+ *   "The string did not match the expected pattern. — location: snippet.tags[0], reason: invalidValue"
+ * Falls back to the raw body text if it isn't the expected JSON shape.
+ */
+function parseGoogleError(bodyText: string): string {
+  try {
+    const data = JSON.parse(bodyText) as GoogleApiErrorBody;
+    const err = data.error;
+    if (err) {
+      const parts: string[] = [];
+      if (err.message) parts.push(err.message);
+
+      const details: string[] = [];
+      for (const e of err.errors ?? []) {
+        const bits: string[] = [];
+        if (e.location) bits.push(`location: ${e.location}`);
+        if (e.reason) bits.push(`reason: ${e.reason}`);
+        if (e.message && e.message !== err.message) bits.push(`detail: ${e.message}`);
+        if (bits.length > 0) details.push(bits.join(", "));
+      }
+      if (details.length > 0) parts.push(details.join("; "));
+
+      if (parts.length > 0) return parts.join(" — ");
+    }
+  } catch {
+    // Not JSON — fall through to raw text
+  }
+  return bodyText.slice(0, 500);
 }
