@@ -687,11 +687,20 @@ async function uploadToYouTubeAPI(
 
     if (!initResp.ok) {
       const errText = await initResp.text();
+      const googleError = parseGoogleError(errText);
+      logRejectedMetadata(
+        "initiation POST",
+        initResp.status,
+        googleError,
+        safeTitle,
+        safeDescription,
+        tags
+      );
       console.error("[ClipFlow] Upload initiation failed:", errText);
       return {
         success: false,
         code: "UPLOAD_FAILED",
-        error: `YouTube rejected the upload (${initResp.status}): ${parseGoogleError(errText)}`,
+        error: `YouTube rejected the upload (${initResp.status}): ${googleError}`,
       };
     }
 
@@ -717,11 +726,20 @@ async function uploadToYouTubeAPI(
 
     if (!uploadResp.ok) {
       const errText = await uploadResp.text();
+      const googleError = parseGoogleError(errText);
+      logRejectedMetadata(
+        "video PUT",
+        uploadResp.status,
+        googleError,
+        safeTitle,
+        safeDescription,
+        tags
+      );
       console.error("[ClipFlow] Upload failed:", errText);
       return {
         success: false,
         code: "UPLOAD_FAILED",
-        error: `Failed to upload video (${uploadResp.status}): ${parseGoogleError(errText)}`,
+        error: `Failed to upload video (${uploadResp.status}): ${googleError}`,
       };
     }
 
@@ -770,26 +788,58 @@ function sanitizeTitle(title: string): string {
 }
 
 /**
- * Strip what the YouTube Data API rejects in snippet.description while
- * keeping the description readable. Unlike the title, emojis and format
- * characters (e.g. ZWJ in emoji sequences) are VALID in descriptions and
- * are left untouched. Only control characters are removed — Google rejects
- * them in snippet.description with 400 "The string did not match the
- * expected pattern" — plus replacement/noncharacters and lone surrogates.
- * Newlines (\n), carriage returns (\r) and tabs (\t) are preserved; they
- * are legitimate in descriptions and Google accepts them. Nothing else is
- * collapsed: internal whitespace and line structure survive as-is, only the
- * edges are trimmed (so a removed control char doesn't leave a stray space).
+ * Strip everything the YouTube Data API rejects in snippet.description while
+ * keeping the description readable. Google rejects invisible control/format
+ * characters and noncharacters in snippet.description with 400
+ * "invalidDescription" / "The string did not match the expected pattern".
+ *
+ * REMOVED (in order):
+ *  - All C0/C1 control chars EXCEPT \n (0A), \r (0D), \t (09) — newlines,
+ *    carriage returns and tabs are legitimate in descriptions and kept.
+ *  - Line/paragraph separators U+2028 / U+2029 (control-like line breaks;
+ *    \n already covers newlines).
+ *  - ALL Unicode format characters (General Category \p{Cf}): zero-width
+ *    space U+200B, ZWJ U+200D, bidi marks U+200E/U+200F/U+202A—U+202E, word
+ *    joiner U+2060, soft hyphen U+00AD, BOM/ZWNBSP U+FEFF, Arabic letter
+ *    mark U+061C, tag characters U+E0000—U+E007F, etc. These invisible chars
+ *    are the most likely cause of the observed invalidDescription 400s
+ *    (transcript-derived text is full of them). Trade-off: emoji ZWJ
+ *    sequences (U+200D-joined, e.g. family emoji) render as side-by-side
+ *    emojis — still valid, readable text; a lone ZWJ is invisible and useless
+ *    anyway. NOTHING in Cf is allowlisted — prefer rejecting anything not
+ *    clearly needed.
+ *  - Replacement char U+FFFD and ALL Unicode noncharacters: U+FDD0—U+FDEF,
+ *    U+FFFE/U+FFFF, and U+xFFFE/U+xFFFF for every plane 1—16
+ *    (U+1FFFE—U+10FFFF).
+ *  - Lone surrogates (via stripLoneSurrogates) — an unpaired surrogate makes
+ *    JSON.stringify emit \uD83D-style escapes, which Google also rejects.
+ *
+ * KEPT: \n \r \t, normal whitespace, letters, digits, punctuation, emojis
+ * (minus their ZWJ joiners per the rule above), variation selectors
+ * (U+FE00—U+FE0F, U+E0100—U+E01EF — Mn marks that make emoji render as
+ * emoji; harmless to the validator). Nothing is collapsed: internal
+ * whitespace and line structure survive as-is, only the edges are trimmed.
  */
-function sanitizeDescription(desc: string): string {
+export function sanitizeDescription(desc: string): string {
   return stripLoneSurrogates(desc)
     // All C0/C1 control chars EXCEPT \n (0A), \r (0D), \t (09)
     .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/g, "")
     // Line/paragraph separators (U+2028/U+2029) — control-like line breaks
     // that some validators reject; \n already covers newlines.
     .replace(/[\u2028\u2029]/g, "")
-    // Replacement char + noncharacters (same as title)
-    .replace(/[\uFFFD\uFFFE\uFFFF]/g, "")
+    // ALL format characters (Category Cf): ZWSP U+200B, ZWJ U+200D, bidi
+    // marks U+200E/U+200F/U+202A-U+202E, word joiner U+2060, soft hyphen
+    // U+00AD, BOM U+FEFF, tag chars U+E0000-U+E007F, etc. Invisible chars
+    // are the prime suspect for Google's invalidDescription 400s. Requires
+    // the `u` flag; supported in Bun and Node.
+    .replace(/\p{Cf}/gu, "")
+    // Replacement char + ALL Unicode noncharacters (U+FDD0-U+FDEF, plus
+    // U+FFFE/U+FFFF and each plane's last two code points
+    // U+1FFFE/U+1FFFF — U+10FFFE/U+10FFFF).
+    .replace(
+      /[\uFFFD\uFDD0-\uFDEF\uFFFE\uFFFF\u{1FFFE}\u{1FFFF}\u{2FFFE}\u{2FFFF}\u{3FFFE}\u{3FFFF}\u{4FFFE}\u{4FFFF}\u{5FFFE}\u{5FFFF}\u{6FFFE}\u{6FFFF}\u{7FFFE}\u{7FFFF}\u{8FFFE}\u{8FFFF}\u{9FFFE}\u{9FFFF}\u{AFFFE}\u{AFFFF}\u{BFFFE}\u{BFFFF}\u{CFFFE}\u{CFFFF}\u{DFFFE}\u{DFFFF}\u{EFFFE}\u{EFFFF}\u{FFFFE}\u{FFFFF}\u{10FFFE}\u{10FFFF}]/gu,
+      ""
+    )
     // Trim edges only (never collapses internal whitespace/newlines) so a
     // removed control char at the start/end doesn't leave a stray space.
     .trim();
@@ -805,7 +855,7 @@ function stripLoneSurrogates(s: string): string {
 }
 
 /** Truncate by Unicode code points so we never split a surrogate pair. */
-function truncateToCodePoints(s: string, max: number): string {
+export function truncateToCodePoints(s: string, max: number): string {
   if (s.length <= max) return s;
   return Array.from(s).slice(0, max).join("");
 }
@@ -852,6 +902,28 @@ interface GoogleApiErrorBody {
   };
 }
 
+/**
+ * Log the exact sanitized metadata that was sent to YouTube when a request
+ * is rejected with a 4xx, so any future rejection (invalidDescription,
+ * invalidValue, pattern mismatch, ...) is diagnosable from .run/server.log
+ * without guessing. JSON.stringify is used so invisible/control characters
+ * surface as \u escapes in the log. User-facing errors are NOT changed here.
+ */
+function logRejectedMetadata(
+  phase: string,
+  status: number,
+  googleError: string,
+  title: string,
+  description: string,
+  tags: string[]
+): void {
+  console.error(
+    `[ClipFlow] ${phase} rejected with HTTP ${status}: ${googleError}`
+  );
+  console.error(
+    `[ClipFlow] FAILING SANITIZED METADATA: title=${JSON.stringify(title)} description=${JSON.stringify(description)} tags=${JSON.stringify(tags)}`
+  );
+}
 /**
  * Parse a Google API error response body and return a human-readable
  * string with the real reason, e.g.:
