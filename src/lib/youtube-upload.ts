@@ -479,11 +479,12 @@ async function uploadToYouTubeAPI(
   // Sanitize metadata BEFORE truncation so we never split a surrogate pair
   // (a lone surrogate makes JSON.stringify emit \uD83D-style escapes, which
   // Google rejects with "The string did not match the expected pattern").
+  // The description gets the same treatment: Google's Data API also rejects
+  // control characters in snippet.description with 400 "The string did not
+  // match the expected pattern" — sanitizeDescription strips them while
+  // keeping legitimate newlines, tabs, emojis and format chars intact.
   const safeTitle = truncateToCodePoints(sanitizeTitle(title), 100);
-  const safeDescription = truncateToCodePoints(
-    stripLoneSurrogates(description),
-    5000
-  );
+  const safeDescription = truncateToCodePoints(sanitizeDescription(description), 5000);
 
   // Extract + sanitize tags from hashtags in description
   const tags = extractTags(description);
@@ -599,6 +600,32 @@ function sanitizeTitle(title: string): string {
     .replace(/\p{Cf}/gu, "") // format characters (ZWJ, bidi, soft hyphen…)
     .replace(/[\uFFFD\uFFFE\uFFFF]/gu, "") // replacement char + noncharacters
     .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * Strip what the YouTube Data API rejects in snippet.description while
+ * keeping the description readable. Unlike the title, emojis and format
+ * characters (e.g. ZWJ in emoji sequences) are VALID in descriptions and
+ * are left untouched. Only control characters are removed — Google rejects
+ * them in snippet.description with 400 "The string did not match the
+ * expected pattern" — plus replacement/noncharacters and lone surrogates.
+ * Newlines (\n), carriage returns (\r) and tabs (\t) are preserved; they
+ * are legitimate in descriptions and Google accepts them. Nothing else is
+ * collapsed: internal whitespace and line structure survive as-is, only the
+ * edges are trimmed (so a removed control char doesn't leave a stray space).
+ */
+function sanitizeDescription(desc: string): string {
+  return stripLoneSurrogates(desc)
+    // All C0/C1 control chars EXCEPT \n (0A), \r (0D), \t (09)
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/g, "")
+    // Line/paragraph separators (U+2028/U+2029) — control-like line breaks
+    // that some validators reject; \n already covers newlines.
+    .replace(/[\u2028\u2029]/g, "")
+    // Replacement char + noncharacters (same as title)
+    .replace(/[\uFFFD\uFFFE\uFFFF]/g, "")
+    // Trim edges only (never collapses internal whitespace/newlines) so a
+    // removed control char at the start/end doesn't leave a stray space.
     .trim();
 }
 
