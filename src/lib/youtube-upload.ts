@@ -668,7 +668,7 @@ async function uploadToYouTubeAPI(
       categoryId: "22", // People & Blogs
     },
     status: {
-      privacyStatus: "unlisted",
+      privacyStatus: "public",
       selfDeclaredMadeForKids: false,
     },
   };
