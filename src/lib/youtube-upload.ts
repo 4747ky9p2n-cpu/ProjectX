@@ -1,13 +1,18 @@
 /**
  * YouTube Shorts Upload Pipeline
  *
- * Downloads a segment of a YouTube video using yt-dlp, re-encodes it to
- * vertical 9:16 Shorts format using ffmpeg, and uploads it to the user's
- * connected YouTube channel via the YouTube Data API v3.
+ * Downloads the source video via the Supadata download API (works from
+ * datacenter IPs where yt-dlp is bot-blocked by YouTube), cuts the clip
+ * segment with ffmpeg, re-encodes it to vertical 9:16 Shorts format, and
+ * uploads it to the user's connected YouTube channel via the YouTube Data
+ * API v3.
+ *
+ * yt-dlp is kept only as a last-resort fallback when the Supadata download
+ * URL itself fails to produce a file (it is bot-blocked on this host).
  *
  * Prerequisites (system):
- *   yt-dlp  — pip3 install yt-dlp
  *   ffmpeg  — apt install ffmpeg (or equivalent)
+ *   yt-dlp  — optional, fallback only
  */
 
 import { getValidAccessToken } from "./youtube-auth";
@@ -74,7 +79,6 @@ export async function getToolStatus(): Promise<{
 }> {
   const tools = await checkTools();
   const missing: string[] = [];
-  if (!tools.ytdlp) missing.push("yt-dlp (pip3 install yt-dlp)");
   if (!tools.ffmpeg) missing.push("ffmpeg (apt install ffmpeg)");
 
   return {
@@ -108,16 +112,13 @@ export async function uploadClipToYouTube(
     };
   }
 
-  // ── 2. Check tools ──
+  // ── 2. Check tools (only ffmpeg is required; yt-dlp is an optional fallback) ──
   const tools = await checkTools();
-  if (!tools.ytdlp || !tools.ffmpeg) {
-    const missing: string[] = [];
-    if (!tools.ytdlp) missing.push("yt-dlp (run: pip3 install yt-dlp)");
-    if (!tools.ffmpeg) missing.push("ffmpeg (run: apt install ffmpeg)");
+  if (!tools.ffmpeg) {
     return {
       success: false,
       code: "MISSING_TOOLS",
-      error: `Video processing tools are not installed. Missing: ${missing.join(", ")}`,
+      error: "Video processing tool ffmpeg is not installed. Run: apt install ffmpeg",
     };
   }
 
@@ -129,48 +130,35 @@ export async function uploadClipToYouTube(
   try {
     await Bun.$`mkdir -p ${workDir}`.quiet();
 
-    // ── 4. Download clip segment with yt-dlp ──
-    const startEnd = `*${input.startTime}-${input.endTime}`;
-    console.log(`[ClipFlow] Downloading clip: ${input.videoUrl} [${startEnd}]`);
-
-    const dlResult = await Bun.$`yt-dlp \
-      --download-sections ${startEnd} \
-      -f "best[height<=1080]" \
-      -o ${rawClipPath} \
-      --no-playlist \
-      --no-warnings \
-      ${input.videoUrl}`
-      .quiet()
-      .nothrow();
-
-    if (dlResult.exitCode !== 0) {
+    // ── 4. Download source video (Supadata API primary, yt-dlp fallback) ──
+    console.log(`[ClipFlow] Downloading source video: ${input.videoUrl}`);
+    const download = await downloadSourceVideo(input.videoUrl, rawClipPath);
+    if (!download.ok) {
       // Clean up
       await Bun.$`rm -rf ${workDir}`.quiet().nothrow();
       return {
         success: false,
         code: "DOWNLOAD_FAILED",
-        error: "Failed to download video segment. The source video may be unavailable or restricted.",
+        error: download.error,
       };
     }
 
-    // Wait for the file to exist
-    const rawFile = Bun.file(rawClipPath);
-    if (!(await rawFile.exists())) {
-      await Bun.$`rm -rf ${workDir}`.quiet().nothrow();
-      return {
-        success: false,
-        code: "DOWNLOAD_FAILED",
-        error: "Download completed but the output file was not found.",
-      };
-    }
-
-    // ── 5. Re-encode to vertical 9:16 Shorts format ──
-    console.log(`[ClipFlow] Encoding to vertical 9:16 Shorts format`);
+    // ── 5. Cut the clip segment and re-encode to vertical 9:16 Shorts ──
+    // Both download paths produce the FULL source video in raw.mp4, so we
+    // cut the clip with ffmpeg input-seek -ss <start> -t <duration>.
+    const clipStart = input.startTime;
+    const clipDuration = Math.max(0.1, input.endTime - input.startTime);
+    console.log(
+      `[ClipFlow] Encoding to vertical 9:16 Shorts format (start=${clipStart}s, dur=${clipDuration}s)`
+    );
 
     const encodeResult = await Bun.$`ffmpeg \
+      -ss ${clipStart} \
       -i ${rawClipPath} \
+      -t ${clipDuration} \
       -vf "crop=ih*9/16:ih,scale=1080:1920" \
-      -c:a copy \
+      -c:v libx264 -preset veryfast -crf 23 \
+      -c:a aac -b:a 128k \
       -y \
       ${shortPath}`
       .quiet()
@@ -219,6 +207,259 @@ export async function uploadClipToYouTube(
       error: err instanceof Error ? err.message : "Unexpected error during upload.",
     };
   }
+}
+
+/* ─────────────────────────────────────────────
+   Video Download (Supadata primary, yt-dlp fallback)
+   ───────────────────────────────────────────── */
+
+/**
+ * Reads the Supadata API key from the environment, falling back to the
+ * project key so the site works without env vars configured.
+ */
+function supadataApiKey(): string {
+  return process.env.SUPADATA_API_KEY || "sd_f8518e4e6943014d9d87d2012fa004a6";
+}
+
+interface DownloadSuccess {
+  ok: true;
+}
+
+interface DownloadFailure {
+  ok: false;
+  error: string;
+}
+
+type DownloadOutcome = DownloadSuccess | DownloadFailure;
+
+/**
+ * Download the source video to `rawClipPath`.
+ *
+ * Strategy:
+ *   1. Ask Supadata's download API for a direct video URL (or the bytes).
+ *   2. Stream the bytes to disk.
+ *   3. If Supadata's API call failed with a plan/limit error (limit-exceeded
+ *      or another 4xx), return a clear error — no fallback, because yt-dlp is
+ *      bot-blocked from this host anyway.
+ *   4. Only if Supadata gave us a URL but the download from it failed do we
+ *      fall back to yt-dlp.
+ */
+export async function downloadSourceVideo(
+  videoUrl: string,
+  rawClipPath: string
+): Promise<DownloadOutcome> {
+  // ── Primary: Supadata download API ──
+  const res = await fetchSupadataDownload(videoUrl);
+  if (res.ok) {
+    try {
+      const contentType = res.response.headers.get("content-type") || "";
+      if (
+        contentType.includes("video") ||
+        contentType.includes("octet-stream") ||
+        contentType.includes("binary")
+      ) {
+        // Response body IS the video — stream it straight to disk.
+        await Bun.write(rawClipPath, res.response);
+      } else {
+        const data = await res.response.json().catch(() => null);
+        const downloadUrl = extractDownloadUrl(data);
+        if (!downloadUrl) {
+          console.error(
+            "[ClipFlow] Supadata download response had no URL field:",
+            JSON.stringify(data).slice(0, 500)
+          );
+          return await downloadViaYtDlpFallback(videoUrl, rawClipPath);
+        }
+        await downloadVideoBytes(downloadUrl, rawClipPath);
+      }
+
+      const file = Bun.file(rawClipPath);
+      if (await file.exists()) {
+        const size = file.size;
+        console.log(`[ClipFlow] Source video downloaded (${size} bytes)`);
+        if (size > 0) return { ok: true };
+        return {
+          ok: false,
+          error:
+            "Downloaded video file is empty. The source video may be unavailable or restricted.",
+        };
+      }
+      return await downloadViaYtDlpFallback(videoUrl, rawClipPath);
+    } catch (err) {
+      // The download URL fetch failed (network error, timeout, dead link).
+      // Keep yt-dlp as a fallback ONLY in this case.
+      console.error("[ClipFlow] Supadata video download failed:", err);
+      return await downloadViaYtDlpFallback(videoUrl, rawClipPath);
+    }
+  }
+
+  // Supadata API call itself failed. For limit/plan errors and other 4xx we
+  // surface a clear error to the user instead of trying yt-dlp (bot-blocked).
+  console.error(`[ClipFlow] Supadata download API error: ${res.error}`);
+  if (res.kind === "limit" || res.kind === "4xx") {
+    return { ok: false, error: res.error };
+  }
+  // 5xx / network failure: try the yt-dlp fallback as a last resort.
+  return await downloadViaYtDlpFallback(videoUrl, rawClipPath);
+}
+
+/** yt-dlp fallback: download the full video (best <=1080p) to rawClipPath. */
+async function downloadViaYtDlpFallback(
+  videoUrl: string,
+  rawClipPath: string
+): Promise<DownloadOutcome> {
+  try {
+    const dlResult = await Bun.$`yt-dlp \
+      -f "best[height<=1080]" \
+      -o ${rawClipPath} \
+      --no-playlist \
+      --no-warnings \
+      ${videoUrl}`
+      .quiet()
+      .nothrow();
+
+    if (dlResult.exitCode !== 0) {
+      return {
+        ok: false,
+        error:
+          "Failed to download the video. Supadata download failed and the yt-dlp fallback is blocked on this host (YouTube bot detection).",
+      };
+    }
+    const file = Bun.file(rawClipPath);
+    if (!(await file.exists()) || file.size === 0) {
+      return {
+        ok: false,
+        error: "Download completed but the output file was not found.",
+      };
+    }
+    return { ok: true };
+  } catch (err) {
+    return {
+      ok: false,
+      error:
+        err instanceof Error
+          ? err.message
+          : "Failed to download the video (yt-dlp fallback error).",
+    };
+  }
+}
+
+/**
+ * Call the Supadata video download API.
+ * GET https://api.supadata.ai/v1/youtube/video/download?url=<encoded>
+ *
+ * The endpoint is not in the public OpenAPI docs, so we handle both JSON
+ * responses with a URL field and raw binary/video responses defensively.
+ */
+async function fetchSupadataDownload(videoUrl: string): Promise<
+  | { ok: true; response: Response }
+  | { ok: false; error: string; kind: "limit" | "4xx" | "5xx" | "network" }
+> {
+  const apiUrl = `https://api.supadata.ai/v1/youtube/video/download?url=${encodeURIComponent(videoUrl)}`;
+  const TIMEOUT_MS = 60_000;
+
+  try {
+    const resp = await fetch(apiUrl, {
+      headers: { "x-api-key": supadataApiKey() },
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+    });
+
+    if (resp.ok) return { ok: true, response: resp };
+
+    const bodyText = await resp.text().catch(() => "");
+    console.error(`[ClipFlow] Supadata download API ${resp.status}: ${bodyText.slice(0, 500)}`);
+
+    // Parse the documented error JSON shape:
+    // { "error": "...", "message": "...", "details": "...", "documentationUrl": "..." }
+    let parsed: { error?: string; message?: string; details?: string } | null = null;
+    try {
+      const raw = JSON.parse(bodyText);
+      if (raw && typeof raw === "object") {
+        parsed = raw as { error?: string; message?: string; details?: string };
+      }
+    } catch {
+      parsed = null;
+    }
+
+    const isLimit =
+      resp.status === 429 ||
+      parsed?.error === "limit-exceeded" ||
+      (parsed?.error ?? "").toLowerCase().includes("limit");
+
+    if (isLimit) {
+      return {
+        ok: false,
+        kind: "limit",
+        error:
+          "The video download service limit was reached. Please upgrade the Supadata plan (supadata.ai).",
+      };
+    }
+
+    if (resp.status >= 400 && resp.status < 500) {
+      const reason = parsed
+        ? [parsed.message, parsed.details].filter(Boolean).join(" — ")
+        : bodyText.trim() || resp.statusText;
+      return {
+        ok: false,
+        kind: "4xx",
+        error: `Video download failed (Supadata API ${resp.status}): ${reason || "request rejected"}`,
+      };
+    }
+
+    return { ok: false, kind: "5xx", error: `Supadata download API returned ${resp.status}` };
+  } catch (err) {
+    return {
+      ok: false,
+      kind: "network",
+      error: `Supadata download API request failed: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+}
+
+/**
+ * Defensively extract a direct video URL from a Supadata download response.
+ * Handles {downloadUrl}, {url}, {videoUrl} and nested {data:*}/{video:*}/{result:*} shapes.
+ */
+function extractDownloadUrl(data: unknown): string | null {
+  if (typeof data !== "object" || data === null) return null;
+  const obj = data as Record<string, unknown>;
+
+  for (const key of ["downloadUrl", "url", "videoUrl", "download_url", "video_url"]) {
+    const v = obj[key];
+    if (typeof v === "string" && v.startsWith("http")) return v;
+  }
+
+  for (const nested of ["data", "video", "result"]) {
+    const child = obj[nested];
+    if (typeof child === "object" && child !== null) {
+      const found = extractDownloadUrl(child);
+      if (found) return found;
+    }
+  }
+
+  // Some shapes wrap URLs in an array, e.g. {formats: [{url, ...}]} —
+  // take the first usable entry.
+  for (const key of ["formats", "urls", "downloads"]) {
+    const list = obj[key];
+    if (Array.isArray(list)) {
+      for (const entry of list) {
+        const found = extractDownloadUrl(entry);
+        if (found) return found;
+      }
+    }
+  }
+
+  return null;
+}
+
+/** Stream a direct video URL to disk (large files — no full in-memory buffer). */
+async function downloadVideoBytes(url: string, destPath: string): Promise<void> {
+  // 10-minute cap: a full-length video at a decent bitrate fits well inside it.
+  const resp = await fetch(url, { signal: AbortSignal.timeout(600_000) });
+  if (!resp.ok) {
+    throw new Error(`Video download failed (HTTP ${resp.status})`);
+  }
+  await Bun.write(destPath, resp);
 }
 
 /* ─────────────────────────────────────────────

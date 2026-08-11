@@ -12,7 +12,8 @@ export interface TranscriptSegment {
    Main entry point — multi-strategy transcript fetch
    ───────────────────────────────────────────── */
 
-const SUPADATA_API_KEY = "sd_f8518e4e6943014d9d87d2012fa004a6";
+const SUPADATA_API_KEY =
+  process.env.SUPADATA_API_KEY || "sd_f8518e4e6943014d9d87d2012fa004a6";
 
 /**
  * yt-dlp fallback is DISABLED: YouTube blocks this datacenter IP with bot
