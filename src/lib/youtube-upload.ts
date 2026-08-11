@@ -1,14 +1,17 @@
 /**
  * YouTube Shorts Upload Pipeline
  *
- * Downloads the source video via the Supadata download API (works from
- * datacenter IPs where yt-dlp is bot-blocked by YouTube), cuts the clip
- * segment with ffmpeg, re-encodes it to vertical 9:16 Shorts format, and
- * uploads it to the user's connected YouTube channel via the YouTube Data
- * API v3.
+ * Downloads the source video, cuts the clip segment with ffmpeg, re-encodes
+ * it to vertical 9:16 Shorts format, and uploads it to the user's connected
+ * YouTube channel via the YouTube Data API v3.
  *
- * yt-dlp is kept only as a last-resort fallback when the Supadata download
- * URL itself fails to produce a file (it is bot-blocked on this host).
+ * Download strategy (all work from datacenter IPs where direct yt-dlp is
+ * bot-blocked by YouTube):
+ *   1. Piped public API (free, no key) — primary. The instance proxy serves
+ *      a muxed mp4 that downloads reliably from this host.
+ *   2. Supadata download API (free tier) — first fallback.
+ *   3. yt-dlp — last resort, only when the Supadata API gave us a URL but the
+ *      download from it failed (bot-blocked on this host, so rarely useful).
  *
  * Prerequisites (system):
  *   ffmpeg  — apt install ffmpeg (or equivalent)
@@ -210,8 +213,21 @@ export async function uploadClipToYouTube(
 }
 
 /* ─────────────────────────────────────────────
-   Video Download (Supadata primary, yt-dlp fallback)
+   Video Download (Piped primary, Supadata fallback, yt-dlp last resort)
    ───────────────────────────────────────────── */
+
+/**
+ * Piped API instances to try, in order. The first one is confirmed working
+ * from this host (2026-08): the instance's own proxy serves a muxed mp4.
+ * The others are the historically registered Piped instances — they may come
+ * and go, so the loop skips any that fail and moves to the next.
+ */
+const PIPED_INSTANCES = [
+  "https://api.piped.private.coffee",
+  "https://pipedapi.adminforge.de",
+  "https://pipedapi.kavin.rocks",
+  "https://pipedapi.drgns.space",
+];
 
 /**
  * Reads the Supadata API key from the environment, falling back to the
@@ -236,8 +252,11 @@ type DownloadOutcome = DownloadSuccess | DownloadFailure;
  * Download the source video to `rawClipPath`.
  *
  * Strategy:
- *   1. Ask Supadata's download API for a direct video URL (or the bytes).
- *   2. Stream the bytes to disk.
+ *   1. Piped public API (free, no key) — primary. Try each instance in
+ *      `PIPED_INSTANCES`; the first that returns a muxed mp4 stream whose
+ *      bytes download to a non-empty, non-HTML file wins.
+ *   2. If Piped failed on every instance, ask Supadata's download API for a
+ *      direct video URL (or the bytes) and stream them to disk.
  *   3. If Supadata's API call failed with a plan/limit error (limit-exceeded
  *      or another 4xx), return a clear error — no fallback, because yt-dlp is
  *      bot-blocked from this host anyway.
@@ -248,7 +267,11 @@ export async function downloadSourceVideo(
   videoUrl: string,
   rawClipPath: string
 ): Promise<DownloadOutcome> {
-  // ── Primary: Supadata download API ──
+  // ── Primary: Piped public API (free, no key) ──
+  const piped = await downloadViaPiped(videoUrl, rawClipPath);
+  if (piped.ok) return piped;
+
+  // ── Fallback 1: Supadata download API ──
   const res = await fetchSupadataDownload(videoUrl);
   if (res.ok) {
     try {
@@ -259,7 +282,7 @@ export async function downloadSourceVideo(
         contentType.includes("binary")
       ) {
         // Response body IS the video — stream it straight to disk.
-        await Bun.write(rawClipPath, res.response);
+        await streamResponseToFile(res.response, rawClipPath);
       } else {
         const data = await res.response.json().catch(() => null);
         const downloadUrl = extractDownloadUrl(data);
@@ -301,6 +324,125 @@ export async function downloadSourceVideo(
   }
   // 5xx / network failure: try the yt-dlp fallback as a last resort.
   return await downloadViaYtDlpFallback(videoUrl, rawClipPath);
+}
+
+/**
+ * Extract a YouTube video ID from a watch/shorts/youtu.be/embed URL.
+ * Returns null if the URL doesn't look like a YouTube video URL.
+ */
+function extractYouTubeVideoId(videoUrl: string): string | null {
+  const m = videoUrl.match(
+    /(?:[?&]v=|youtu\.be\/|shorts\/|embed\/|live\/)([A-Za-z0-9_-]{11})/
+  );
+  return m ? m[1] : null;
+}
+
+/**
+ * Pick the best muxed mp4 stream from a Piped `/streams/<id>` response.
+ * Piped's `videoStreams` are muxed (video+audio); prefer 720p, then 360p,
+ * then any other real YouTube mp4. LBRY/Odysee mirrors (player.odycdn.com)
+ * are excluded — they are unrelated re-uploads and are not YouTube content.
+ */
+function pickBestPipedMp4Stream(
+  streams: unknown
+): { url: string } | null {
+  if (!Array.isArray(streams)) return null;
+  let best: { url: string; rank: number } | null = null;
+  for (const s of streams) {
+    if (typeof s !== "object" || s === null) continue;
+    const entry = s as Record<string, unknown>;
+    const mime = typeof entry.mimeType === "string" ? entry.mimeType : "";
+    const url = typeof entry.url === "string" ? entry.url : "";
+    const quality = typeof entry.quality === "string" ? entry.quality : "";
+    if (!mime.includes("mp4") || !url) continue;
+    if (url.includes("player.odycdn.com") || quality === "LBRY") continue;
+    const rank = quality.includes("720") ? 3 : quality.includes("360") ? 2 : 1;
+    if (!best || rank > best.rank) best = { url, rank };
+  }
+  return best ? { url: best.url } : null;
+}
+
+/**
+ * Quick sanity check that the downloaded file is actually video bytes and not
+ * an HTML error/challenge page (which some Piped/Invidious endpoints return
+ * with a 200 status). mp4/mkv files never start with '<' or a JSON brace.
+ */
+async function looksLikeVideoFile(path: string): Promise<boolean> {
+  // Real video files are always > 100 KB; HTML/challenge/error pages are
+  // ~7-60 KB. A pure size check avoids fragile content sniffing on files
+  // that were just written by the same process (Bun quirk: reading back the
+  // first bytes immediately can misbehave). Anything that slips through
+  // fails loudly at the ffmpeg step with a clear error.
+  try {
+    const file = Bun.file(path);
+    return (await file.exists()) && file.size >= 100_000;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Primary (free) download path: Piped public API, no key required.
+ *
+ * For each instance in `PIPED_INSTANCES`, GET `<instance>/streams/<videoId>`,
+ * pick the best muxed mp4 from `videoStreams`, and stream it to
+ * `rawClipPath`. Returns ok only when a non-empty, non-HTML file was written.
+ * Each instance gets a short timeout so one dead instance costs at most a few
+ * seconds before the next one (or the Supadata fallback) is tried.
+ */
+async function downloadViaPiped(
+  videoUrl: string,
+  rawClipPath: string
+): Promise<DownloadOutcome> {
+  const videoId = extractYouTubeVideoId(videoUrl);
+  if (!videoId) {
+    console.error(`[ClipFlow] Could not extract a YouTube video ID from: ${videoUrl}`);
+    return { ok: false, error: "Invalid YouTube URL." };
+  }
+
+  for (const instance of PIPED_INSTANCES) {
+    try {
+      const apiUrl = `${instance}/streams/${videoId}`;
+      const resp = await fetch(apiUrl, { signal: AbortSignal.timeout(20_000) });
+      if (!resp.ok) {
+        console.error(`[ClipFlow] Piped API ${resp.status} from ${instance}`);
+        continue;
+      }
+      const data = (await resp.json().catch(() => null)) as Record<string, unknown> | null;
+      if (!data || typeof data !== "object" || data.error) {
+        console.error(`[ClipFlow] Piped API from ${instance} returned no usable data`);
+        continue;
+      }
+      const stream = pickBestPipedMp4Stream(data.videoStreams);
+      if (!stream) {
+        console.error(`[ClipFlow] Piped API from ${instance} returned no muxed mp4 stream`);
+        continue;
+      }
+
+      // Some instances return relative stream URLs that are served by their
+      // own proxy — resolve them against the instance proxy (or the API host).
+      let downloadUrl = stream.url;
+      if (downloadUrl.startsWith("/")) {
+        const proxy = typeof data.proxyUrl === "string" ? data.proxyUrl : instance;
+        downloadUrl = `${proxy}${downloadUrl}`;
+      }
+
+      await downloadVideoBytes(downloadUrl, rawClipPath);
+      if (await looksLikeVideoFile(rawClipPath)) {
+        const size = Bun.file(rawClipPath).size;
+        console.log(`[ClipFlow] Source video downloaded via Piped (${instance}, ${size} bytes)`);
+        return { ok: true };
+      }
+      console.error(`[ClipFlow] Piped download from ${instance} produced no video file`);
+    } catch (err) {
+      console.error(`[ClipFlow] Piped download failed (${instance}):`, err);
+    }
+  }
+
+  return {
+    ok: false,
+    error: "Piped download failed on all instances — trying Supadata.",
+  };
 }
 
 /** yt-dlp fallback: download the full video (best <=1080p) to rawClipPath. */
@@ -452,14 +594,38 @@ function extractDownloadUrl(data: unknown): string | null {
   return null;
 }
 
-/** Stream a direct video URL to disk (large files — no full in-memory buffer). */
+/**
+ * Stream a direct video URL to disk (large files — no full in-memory buffer).
+ *
+ * NOTE: `Bun.write(destPath, resp)` (Response) HANGS on this Bun version when
+ * the body is large — the fetch resolves but the write never completes. So we
+ * drain the body manually through a Bun file writer, which streams properly.
+ */
 async function downloadVideoBytes(url: string, destPath: string): Promise<void> {
   // 10-minute cap: a full-length video at a decent bitrate fits well inside it.
   const resp = await fetch(url, { signal: AbortSignal.timeout(600_000) });
   if (!resp.ok) {
     throw new Error(`Video download failed (HTTP ${resp.status})`);
   }
-  await Bun.write(destPath, resp);
+  await streamResponseToFile(resp, destPath);
+}
+
+/** Drain a fetch Response body to disk via a Bun file writer (streaming). */
+async function streamResponseToFile(resp: Response, destPath: string): Promise<void> {
+  const writer = Bun.file(destPath).writer();
+  try {
+    for await (const chunk of resp.body as unknown as AsyncIterable<Uint8Array>) {
+      await writer.write(chunk);
+    }
+  } finally {
+    try {
+      // Bun's FileSink.end() is not a promise on this version — await is a
+      // no-op if it returns void, and works if it ever returns a promise.
+      await writer.end();
+    } catch {
+      // Ignore end() failures; the chunk writes already happened.
+    }
+  }
 }
 
 /* ─────────────────────────────────────────────
