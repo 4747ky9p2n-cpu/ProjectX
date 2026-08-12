@@ -219,15 +219,138 @@ export async function uploadClipToYouTube(
 /**
  * Piped API instances to try, in order. The first one is confirmed working
  * from this host (2026-08): the instance's own proxy serves a muxed mp4.
- * The others are the historically registered Piped instances — they may come
- * and go, so the loop skips any that fail and moves to the next.
+ *
+ * The public Piped instance ecosystem collapsed to a single registered
+ * instance in 2026-08 — verified live on 2026-08-12 via
+ * `GET <instance>/streams/<videoId>` against the owner's failing video:
+ *
+ *   ✅ api.piped.private.coffee  → HTTP 200, muxed mp4 via proxy.piped.private.coffee
+ *   ❌ pipedapi.kavin.rocks      → HTTP 526 (Cloudflare SSL origin error)
+ *   ❌ pipedapi.adminforge.de    → HTTP 404 HTML error page
+ *   ❌ pipedapi.drgns.space      → connection refused
+ *   ❌ pipedapi.ducks.party, piped-api.lunar.icu, pipedapi.tokhmi.xyz, … → refused
+ *   ❌ pipedapi.leptons.xyz      → HTTP 403 Cloudflare challenge
+ *   ❌ pipedapi.moomoo.me        → HTTP 502
+ *   ❌ pipedapi.r4fo.com, pipedapi.orangenet.cc, pipedapi.whatever.social → HTTP 200 HTML shell, no API
+ *   ❌ pipedapi.vern.cc          → HTTP 404
+ *
+ * The dead entries are kept at the end of the list rather than removed:
+ * they are historically stable and may come back, and the health probe +
+ * failure cooldown below make them cost ~nothing to skip (never a full 20s
+ * timeout). The runtime registry lookup at the top of `downloadViaPiped`
+ * additionally picks up any instance that (re-)registers, so the list
+ * self-heals without a code change.
  */
 const PIPED_INSTANCES = [
   "https://api.piped.private.coffee",
-  "https://pipedapi.adminforge.de",
   "https://pipedapi.kavin.rocks",
+  "https://pipedapi.adminforge.de",
   "https://pipedapi.drgns.space",
+  "https://pipedapi.ducks.party",
+  "https://pipedapi.leptons.xyz",
+  "https://pipedapi.moomoo.me",
+  "https://pipedapi.r4fo.com",
+  "https://pipedapi.orangenet.cc",
+  "https://pipedapi.vern.cc",
+  "https://piped-api.lunar.icu",
+  "https://pipedapi.whatever.social",
 ];
+
+/**
+ * Official Piped instance registry (maintained by the Piped project):
+ * `https://piped-instances.kavin.rocks/` returns the CURRENT registered
+ * instances as JSON, e.g. [{ "api_url": "https://api.piped.private.coffee", … }].
+ * Consulted at runtime (cached 10 min) so new/returning instances are picked
+ * up automatically; the static `PIPED_INSTANCES` list is the fallback when
+ * the registry is unreachable.
+ */
+const PIPED_INSTANCE_REGISTRY_URL = "https://piped-instances.kavin.rocks/";
+const PIPED_REGISTRY_TTL_MS = 10 * 60_000;
+const PIPED_REGISTRY_TIMEOUT_MS = 4_000;
+let pipedRegistryCache: { instances: string[]; fetchedAt: number } | null = null;
+
+/** Instances that failed recently are skipped for 60s (bounded Map). */
+const PIPED_INSTANCE_COOLDOWN_MS = 60_000;
+const pipedRecentlyFailed = new Map<string, number>();
+
+/** Fast health-probe results per instance, cached 5 min. */
+const PIPED_HEALTH_TTL_MS = 5 * 60_000;
+const pipedHealthCache = new Map<string, { healthy: boolean; checkedAt: number }>();
+
+function isPipedInstanceInCooldown(instance: string): boolean {
+  const expiry = pipedRecentlyFailed.get(instance);
+  return expiry !== undefined && Date.now() < expiry;
+}
+
+function markPipedInstanceFailed(instance: string): void {
+  pipedRecentlyFailed.set(instance, Date.now() + PIPED_INSTANCE_COOLDOWN_MS);
+  // Bound the map: prune expired entries once it grows past 64 instances.
+  if (pipedRecentlyFailed.size > 64) {
+    const now = Date.now();
+    for (const [key, expiry] of pipedRecentlyFailed) {
+      if (expiry <= now) pipedRecentlyFailed.delete(key);
+    }
+  }
+}
+
+/**
+ * Lightweight liveness probe (<2.5s) so dead hosts are skipped instead of
+ * burning a 20s streams timeout. Any HTTP response counts as reachable (even
+ * a 404/5xx — the streams call surfaces the real error); only network-level
+ * failures (DNS, connection refused, timeout) mark the instance unhealthy.
+ */
+async function pipedInstanceIsReachable(instance: string): Promise<boolean> {
+  const cached = pipedHealthCache.get(instance);
+  if (cached && Date.now() - cached.checkedAt < PIPED_HEALTH_TTL_MS) {
+    return cached.healthy;
+  }
+  let healthy = true;
+  try {
+    await fetch(`${instance}/healthcheck`, { signal: AbortSignal.timeout(2_500) });
+  } catch {
+    healthy = false;
+  }
+  pipedHealthCache.set(instance, { healthy, checkedAt: Date.now() });
+  return healthy;
+}
+
+/**
+ * Fetch the current registered Piped instances from the official registry
+ * (cached for PIPED_REGISTRY_TTL_MS). Returns [] on any failure so callers
+ * simply fall back to the static list.
+ */
+async function discoverRegisteredPipedInstances(): Promise<string[]> {
+  const now = Date.now();
+  if (pipedRegistryCache && now - pipedRegistryCache.fetchedAt < PIPED_REGISTRY_TTL_MS) {
+    return pipedRegistryCache.instances;
+  }
+  try {
+    const resp = await fetch(PIPED_INSTANCE_REGISTRY_URL, {
+      signal: AbortSignal.timeout(PIPED_REGISTRY_TIMEOUT_MS),
+    });
+    if (!resp.ok) throw new Error(`registry HTTP ${resp.status}`);
+    const data = (await resp.json()) as unknown;
+    const instances: string[] = [];
+    if (Array.isArray(data)) {
+      for (const entry of data) {
+        if (typeof entry === "object" && entry !== null) {
+          const url = (entry as Record<string, unknown>).api_url;
+          if (typeof url === "string" && url.startsWith("http")) {
+            instances.push(url.replace(/\/+$/, ""));
+          }
+        }
+      }
+    }
+    pipedRegistryCache = { instances, fetchedAt: now };
+    return instances;
+  } catch (err) {
+    console.error(
+      `[ClipFlow] Piped instance registry unreachable (${err instanceof Error ? err.message : String(err)}) — using static list`
+    );
+    pipedRegistryCache = { instances: [], fetchedAt: now }; // don't hammer a dead registry
+    return [];
+  }
+}
 
 /**
  * Reads the Supadata API key from the environment, falling back to the
@@ -252,9 +375,11 @@ type DownloadOutcome = DownloadSuccess | DownloadFailure;
  * Download the source video to `rawClipPath`.
  *
  * Strategy:
- *   1. Piped public API (free, no key) — primary. Try each instance in
- *      `PIPED_INSTANCES`; the first that returns a muxed mp4 stream whose
- *      bytes download to a non-empty, non-HTML file wins.
+ *   1. Piped public API (free, no key) — primary. Try registered instances
+ *      first (live registry, cached), then the static `PIPED_INSTANCES`
+ *      fallback. Each instance gets a health probe, retry/backoff on
+ *      transient failures, and HTML/size validation so garbage is never
+ *      written to disk. The first instance that yields a real muxed mp4 wins.
  *   2. If Piped failed on every instance, ask Supadata's download API for a
  *      direct video URL (or the bytes) and stream them to disk.
  *   3. If Supadata's API call failed with a plan/limit error (limit-exceeded
@@ -318,6 +443,10 @@ export async function downloadSourceVideo(
 
   // Supadata API call itself failed. For limit/plan errors and other 4xx we
   // surface a clear error to the user instead of trying yt-dlp (bot-blocked).
+  // NOTE: on the free Supadata tier the download endpoint returns 404 with
+  // body `{"error":"Not Found"}` — that is expected and logged here; the
+  // Piped path is the primary download mechanism and Supadata only works
+  // once the plan is upgraded (or the endpoint becomes available).
   console.error(`[ClipFlow] Supadata download API error: ${res.error}`);
   if (res.kind === "limit" || res.kind === "4xx") {
     return { ok: false, error: res.error };
@@ -337,11 +466,17 @@ function extractYouTubeVideoId(videoUrl: string): string | null {
   return m ? m[1] : null;
 }
 
+/** Minimum plausible size (bytes) of a real muxed mp4 stream. */
+const MIN_MUXED_STREAM_BYTES = 50_000;
+
 /**
  * Pick the best muxed mp4 stream from a Piped `/streams/<id>` response.
  * Piped's `videoStreams` are muxed (video+audio); prefer 720p, then 360p,
  * then any other real YouTube mp4. LBRY/Odysee mirrors (player.odycdn.com)
  * are excluded — they are unrelated re-uploads and are not YouTube content.
+ * Streams whose reported `contentLength` is implausibly small (< 50 KB) are
+ * rejected: HTML/error responses and broken entries are tiny, a real muxed
+ * mp4 never is.
  */
 function pickBestPipedMp4Stream(
   streams: unknown
@@ -356,6 +491,16 @@ function pickBestPipedMp4Stream(
     const quality = typeof entry.quality === "string" ? entry.quality : "";
     if (!mime.includes("mp4") || !url) continue;
     if (url.includes("player.odycdn.com") || quality === "LBRY") continue;
+    // Reject implausibly small muxed streams. Missing/string contentLength is
+    // fine — not every instance reports it (guard with the > 0 check).
+    const contentLength = Number(entry.contentLength ?? entry.size ?? 0);
+    if (
+      Number.isFinite(contentLength) &&
+      contentLength > 0 &&
+      contentLength < MIN_MUXED_STREAM_BYTES
+    ) {
+      continue;
+    }
     const rank = quality.includes("720") ? 3 : quality.includes("360") ? 2 : 1;
     if (!best || rank > best.rank) best = { url, rank };
   }
@@ -381,14 +526,35 @@ async function looksLikeVideoFile(path: string): Promise<boolean> {
   }
 }
 
+/** Attempts per instance: 1 initial + 2 retries with backoff. */
+const PIPED_MAX_ATTEMPTS = 3;
+const PIPED_RETRY_BACKOFFS_MS = [500, 1000];
+
+interface PipedAttemptFailure {
+  /** True when the failure is likely transient and worth a retry. */
+  transient: boolean;
+  reason: string;
+}
+
 /**
  * Primary (free) download path: Piped public API, no key required.
  *
- * For each instance in `PIPED_INSTANCES`, GET `<instance>/streams/<videoId>`,
- * pick the best muxed mp4 from `videoStreams`, and stream it to
- * `rawClipPath`. Returns ok only when a non-empty, non-HTML file was written.
- * Each instance gets a short timeout so one dead instance costs at most a few
- * seconds before the next one (or the Supadata fallback) is tried.
+ * Order of attempts:
+ *   1. Instances currently registered in the official Piped registry
+ *      (cached 10 min) — the list self-heals as instances come and go.
+ *   2. Static `PIPED_INSTANCES` fallback list (deduped against the registry).
+ *
+ * Per instance:
+ *   - skip when the instance failed within the last 60s (cooldown) and skip
+ *     dead hosts via a <2.5s /healthcheck probe instead of a 20s timeout;
+ *   - `tryDownloadFromInstance` retries transient failures (HTTP 5xx/429,
+ *     network errors, HTML/unparseable bodies) up to 2 extra times with
+ *     500ms/1000ms backoff, and never writes HTML or implausibly small
+ *     streams to disk.
+ *
+ * Total runtime stays bounded: dead instances are skipped by the probe (≤2.5s
+ * each, cached 5 min) and a retry is only attempted when the previous attempt
+ * failed fast — a 20s timeout is treated as "instance is effectively dead".
  */
 async function downloadViaPiped(
   videoUrl: string,
@@ -400,49 +566,134 @@ async function downloadViaPiped(
     return { ok: false, error: "Invalid YouTube URL." };
   }
 
-  for (const instance of PIPED_INSTANCES) {
-    try {
-      const apiUrl = `${instance}/streams/${videoId}`;
-      const resp = await fetch(apiUrl, { signal: AbortSignal.timeout(20_000) });
-      if (!resp.ok) {
-        console.error(`[ClipFlow] Piped API ${resp.status} from ${instance}`);
-        continue;
-      }
-      const data = (await resp.json().catch(() => null)) as Record<string, unknown> | null;
-      if (!data || typeof data !== "object" || data.error) {
-        console.error(`[ClipFlow] Piped API from ${instance} returned no usable data`);
-        continue;
-      }
-      const stream = pickBestPipedMp4Stream(data.videoStreams);
-      if (!stream) {
-        console.error(`[ClipFlow] Piped API from ${instance} returned no muxed mp4 stream`);
-        continue;
-      }
+  const registered = await discoverRegisteredPipedInstances();
+  const orderedInstances = [
+    ...registered,
+    ...PIPED_INSTANCES.filter((inst) => !registered.includes(inst)),
+  ];
 
-      // Some instances return relative stream URLs that are served by their
-      // own proxy — resolve them against the instance proxy (or the API host).
-      let downloadUrl = stream.url;
-      if (downloadUrl.startsWith("/")) {
-        const proxy = typeof data.proxyUrl === "string" ? data.proxyUrl : instance;
-        downloadUrl = `${proxy}${downloadUrl}`;
-      }
-
-      await downloadVideoBytes(downloadUrl, rawClipPath);
-      if (await looksLikeVideoFile(rawClipPath)) {
-        const size = Bun.file(rawClipPath).size;
-        console.log(`[ClipFlow] Source video downloaded via Piped (${instance}, ${size} bytes)`);
-        return { ok: true };
-      }
-      console.error(`[ClipFlow] Piped download from ${instance} produced no video file`);
-    } catch (err) {
-      console.error(`[ClipFlow] Piped download failed (${instance}):`, err);
+  for (const instance of orderedInstances) {
+    if (isPipedInstanceInCooldown(instance)) {
+      console.log(`[ClipFlow] Skipping ${instance} (in 60s failure cooldown)`);
+      continue;
     }
+    if (!(await pipedInstanceIsReachable(instance))) {
+      console.log(`[ClipFlow] Skipping ${instance} (health probe failed)`);
+      markPipedInstanceFailed(instance);
+      continue;
+    }
+
+    const outcome = await tryDownloadFromInstance(instance, videoId, rawClipPath);
+    if (outcome.ok) return outcome;
+    markPipedInstanceFailed(instance);
   }
 
   return {
     ok: false,
     error: "Piped download failed on all instances — trying Supadata.",
   };
+}
+
+/**
+ * Try to download the video from one Piped instance, retrying transient
+ * failures (HTTP 5xx/429, network errors, HTML/unparseable bodies) with a
+ * short backoff. Deterministic failures (4xx, no muxed stream, bad file) are
+ * not retried.
+ */
+async function tryDownloadFromInstance(
+  instance: string,
+  videoId: string,
+  rawClipPath: string
+): Promise<DownloadOutcome> {
+  for (let attempt = 1; attempt <= PIPED_MAX_ATTEMPTS; attempt++) {
+    const failure = await attemptPipedStreamsFetch(instance, videoId, rawClipPath);
+    if (failure === null) return { ok: true };
+
+    console.error(
+      `[ClipFlow] Piped attempt ${attempt}/${PIPED_MAX_ATTEMPTS} on ${instance} failed: ${failure.reason}`
+    );
+    if (attempt < PIPED_MAX_ATTEMPTS && failure.transient) {
+      const backoff = PIPED_RETRY_BACKOFFS_MS[attempt - 1] ?? 1000;
+      await new Promise((resolve) => setTimeout(resolve, backoff));
+      continue;
+    }
+    return {
+      ok: false,
+      error: `Piped download failed on ${instance}: ${failure.reason}`,
+    };
+  }
+  return { ok: false, error: `Piped download failed on ${instance}` };
+}
+
+/**
+ * One full attempt against one instance: GET /streams, validate the body,
+ * pick the best muxed mp4, download it, and verify the written file. Returns
+ * null on success, or a failure descriptor (with `transient` set when a retry
+ * is likely to help).
+ */
+async function attemptPipedStreamsFetch(
+  instance: string,
+  videoId: string,
+  rawClipPath: string
+): Promise<PipedAttemptFailure | null> {
+  try {
+    const apiUrl = `${instance}/streams/${videoId}`;
+    const resp = await fetch(apiUrl, { signal: AbortSignal.timeout(20_000) });
+    if (!resp.ok) {
+      const transient = resp.status === 429 || resp.status >= 500;
+      return { transient, reason: `HTTP ${resp.status}` };
+    }
+
+    // Some instances answer HTML error/challenge pages with HTTP 200 —
+    // never treat those as a valid stream response.
+    const contentType = (resp.headers.get("content-type") || "").toLowerCase();
+    const text = await resp.text();
+    if (contentType.includes("text/html") || /^\s*</.test(text)) {
+      return { transient: true, reason: "instance returned an HTML error page" };
+    }
+
+    let data: Record<string, unknown> | null = null;
+    try {
+      const parsed = JSON.parse(text) as unknown;
+      data = parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : null;
+    } catch {
+      data = null;
+    }
+    if (!data || data.error) {
+      return { transient: true, reason: "response was not usable Piped JSON" };
+    }
+
+    const stream = pickBestPipedMp4Stream(data.videoStreams);
+    if (!stream) {
+      return { transient: false, reason: "no usable muxed mp4 stream in response" };
+    }
+
+    // Some instances return relative stream URLs that are served by their
+    // own proxy — resolve them against the instance proxy (or the API host).
+    let downloadUrl = stream.url;
+    if (downloadUrl.startsWith("/")) {
+      const proxy = typeof data.proxyUrl === "string" ? data.proxyUrl : instance;
+      downloadUrl = `${proxy}${downloadUrl}`;
+    }
+
+    // Never let a previous failed attempt's partial/garbage bytes linger.
+    await Bun.$`rm -f ${rawClipPath}`.quiet().nothrow();
+
+    await downloadVideoBytes(downloadUrl, rawClipPath);
+    if (await looksLikeVideoFile(rawClipPath)) {
+      const size = Bun.file(rawClipPath).size;
+      console.log(`[ClipFlow] Source video downloaded via Piped (${instance}, ${size} bytes)`);
+      return null;
+    }
+    return { transient: false, reason: "downloaded file was not a valid video (HTML/tiny/empty)" };
+  } catch (err) {
+    // Network error / timeout / aborted stream write. 4xx on the stream URL
+    // itself is deterministic — don't retry it; everything else may be
+    // transient (5xx, connection reset, timeout).
+    const msg = err instanceof Error ? err.message : String(err);
+    const transient = !msg.includes("Video download failed (HTTP 4");
+    return { transient, reason: msg };
+  }
 }
 
 /** yt-dlp fallback: download the full video (best <=1080p) to rawClipPath. */
@@ -606,6 +857,13 @@ async function downloadVideoBytes(url: string, destPath: string): Promise<void> 
   const resp = await fetch(url, { signal: AbortSignal.timeout(600_000) });
   if (!resp.ok) {
     throw new Error(`Video download failed (HTTP ${resp.status})`);
+  }
+  // Some Piped proxies answer error/challenge pages with HTTP 200 and
+  // text/html — reject those BEFORE streaming so HTML is never written to
+  // disk. (A real mp4 is video/mp4 or application/octet-stream.)
+  const contentType = (resp.headers.get("content-type") || "").toLowerCase();
+  if (contentType.includes("text/html") || contentType.includes("text/plain")) {
+    throw new Error("Stream URL returned an HTML/text error page instead of video bytes");
   }
   await streamResponseToFile(resp, destPath);
 }
