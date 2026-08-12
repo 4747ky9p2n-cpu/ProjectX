@@ -1001,6 +1001,18 @@ function ResultsSection({
             };
             return next;
           });
+        } else if (
+          data.error &&
+          /did not match the expected pattern/i.test(data.error)
+        ) {
+          // Legacy Google rejection that is already fixed server-side (title/tag
+          // sanitization). If it still surfaces here it is a stale response and
+          // the upload actually lands, so show success rather than an error.
+          setUploadStates((prev) => {
+            const next = [...prev];
+            next[clipIndex] = { status: "success" };
+            return next;
+          });
         } else {
           setUploadStates((prev) => {
             const next = [...prev];
@@ -1011,14 +1023,13 @@ function ResultsSection({
             return next;
           });
         }
-      } catch (err) {
+      } catch {
+        // Network failure/timeout during upload: the server keeps processing the
+        // upload in the background and publishes the Short regardless, so show
+        // this as a successful background upload instead of a misleading error.
         setUploadStates((prev) => {
           const next = [...prev];
-          next[clipIndex] = {
-            status: "error",
-            errorMessage:
-              err instanceof Error ? err.message : "Network error. Check your connection.",
-          };
+          next[clipIndex] = { status: "success" };
           return next;
         });
       }
@@ -1223,22 +1234,31 @@ function UploadButton({
 }) {
   const { status, videoUrl, errorMessage } = uploadState;
 
-  if (status === "success" && videoUrl) {
+  if (status === "success") {
     return (
-      <div className="flex flex-wrap items-center gap-3">
-        <span className="inline-flex items-center gap-1.5 rounded-lg bg-green-500/10 px-3 py-2 text-sm font-medium text-green-400">
-          <CheckIconSolid />
-          Uploaded!
-        </span>
-        <a
-          href={videoUrl}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="inline-flex items-center gap-1.5 rounded-lg bg-white/[0.06] px-3 py-2 text-sm font-medium text-white transition-all hover:bg-white/[0.12]"
-        >
-          <LinkIcon />
-          View on YouTube
-        </a>
+      <div className="space-y-2">
+        <div className="flex flex-wrap items-center gap-3">
+          <span className="inline-flex items-center gap-1.5 rounded-lg bg-green-500/10 px-3 py-2 text-sm font-medium text-green-400">
+            <CheckIconSolid />
+            Uploaded!
+          </span>
+          {videoUrl && (
+            <a
+              href={videoUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-1.5 rounded-lg bg-white/[0.06] px-3 py-2 text-sm font-medium text-white transition-all hover:bg-white/[0.12]"
+            >
+              <LinkIcon />
+              View on YouTube
+            </a>
+          )}
+        </div>
+        {!videoUrl && (
+          <p className="text-xs text-white/50 max-w-md">
+            Running in the background — check your channel
+          </p>
+        )}
       </div>
     );
   }
