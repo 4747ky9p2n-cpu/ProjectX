@@ -16,6 +16,7 @@ import {
   handleChannelInfo,
 } from "./src/lib/oauth-handlers";
 import { handleUploadClip } from "./src/lib/upload-handler";
+import { handleChannelVideos } from "./src/lib/channel-handler";
 
 // Pinned, NOT read from the environment. The published preview URL
 // (<label>.<PUBLIC_SITE_DOMAIN>) is reverse-proxied to 0.0.0.0:3000 inside the
@@ -64,6 +65,12 @@ for (let attempt = 1; ; attempt++) {
         }
         if (pathname === "/api/upload/clip" && req.method === "POST") {
           return handleUploadClip(req);
+        }
+        if (
+          pathname === "/api/youtube/channel/videos" &&
+          req.method === "GET"
+        ) {
+          return handleChannelVideos(req);
         }
 
         if (pathname !== "/") {

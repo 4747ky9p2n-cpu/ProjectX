@@ -2,6 +2,7 @@ import { createFileRoute } from "@tanstack/react-router";
 import { createServerFn } from "@tanstack/react-start";
 import { useState, useEffect, useCallback } from "react";
 import type { YouTubeChannel } from "~/lib/youtube-auth";
+import type { ChannelInfo, ChannelVideoItem } from "~/lib/channel-handler";
 import { fetchTranscript } from "~/lib/transcript";
 import type { TranscriptSegment } from "~/lib/transcript";
 import {
@@ -179,6 +180,17 @@ function formatDuration(seconds: number): string {
   return s > 0 ? `${m}m ${s}s` : `${m}m`;
 }
 
+function formatChannelDate(iso: string): string {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  return d.toLocaleDateString(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+  });
+}
+
 function viralScoreColor(score: number): string {
   if (score >= 85) return "from-red-500 to-pink-500";
   if (score >= 70) return "from-orange-500 to-red-500";
@@ -214,10 +226,23 @@ type AppState =
   | { kind: "error"; message: string }
   | { kind: "success"; result: AnalysisResult };
 
+type InputMode = "url" | "channel";
+
+type ChannelFetchState =
+  | { kind: "idle" }
+  | { kind: "loading" }
+  | { kind: "error"; message: string; notConnected?: boolean }
+  | { kind: "success"; channel: ChannelInfo; videos: ChannelVideoItem[] };
+
 function AppPage() {
   const [url, setUrl] = useState("");
   const [clipLength, setClipLength] = useState<ClipLength>(DEFAULT_CLIP_LENGTH);
   const [state, setState] = useState<AppState>({ kind: "idle" });
+  const [mode, setMode] = useState<InputMode>("url");
+  const [channelQuery, setChannelQuery] = useState("");
+  const [channelState, setChannelState] = useState<ChannelFetchState>({
+    kind: "idle",
+  });
   const [connection, setConnection] = useState<ConnectionInfo>({
     connected: false,
     loading: true,
@@ -278,6 +303,80 @@ function AppPage() {
 
   function handleDisconnect() {
     window.location.href = "/api/auth/youtube/disconnect";
+  }
+
+  /** Fetch a channel's recent videos from the new channel endpoint. */
+  async function loadChannelVideos(bypassCache = false) {
+    if (!channelQuery.trim()) return;
+
+    setChannelState({ kind: "loading" });
+
+    try {
+      const resp = await fetch(
+        `/api/youtube/channel/videos?query=${encodeURIComponent(
+          channelQuery.trim()
+        )}${bypassCache ? "&refresh=1" : ""}`
+      );
+      const data = (await resp.json()) as {
+        success: boolean;
+        code?: string;
+        error?: string;
+        channel?: ChannelInfo;
+        videos?: ChannelVideoItem[];
+      };
+
+      if (resp.status === 401 || data.code === "NO_AUTH") {
+        setChannelState({
+          kind: "error",
+          message:
+            "Connect your YouTube account first, then load the channel's videos.",
+          notConnected: true,
+        });
+        return;
+      }
+
+      if (!resp.ok || !data.success || !data.channel || !data.videos) {
+        setChannelState({
+          kind: "error",
+          message: data.error || "Could not load this channel's videos.",
+        });
+        return;
+      }
+
+      setChannelState({
+        kind: "success",
+        channel: data.channel,
+        videos: data.videos,
+      });
+    } catch {
+      setChannelState({
+        kind: "error",
+        message: "Could not load the channel. Please try again.",
+      });
+    }
+  }
+
+  function handleChannelSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    loadChannelVideos();
+  }
+
+  /** Pick a listed video and run the SAME analysis flow as URL mode. */
+  async function handlePickVideo(videoId: string) {
+    setState({ kind: "loading" });
+    try {
+      const result = await analyzeVideo({
+        data: {
+          url: `https://www.youtube.com/watch?v=${videoId}`,
+          clipLength,
+        },
+      });
+      setState({ kind: "success", result });
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : "Something went wrong. Try again.";
+      setState({ kind: "error", message });
+    }
   }
 
   return (
@@ -369,10 +468,37 @@ function AppPage() {
               YouTube Video
             </span>
           </h1>
-          <p className="mb-8 text-gray-400">
-            Paste a YouTube URL below. We'll find the most viral moments and
-            suggest ready-to-clip Shorts.
+          <p className="mb-6 text-gray-400">
+            {mode === "url"
+              ? "Paste a YouTube URL below. We'll find the most viral moments and suggest ready-to-clip Shorts."
+              : "Enter a YouTuber's channel (handle or URL). We'll list their recent videos — pick one and we'll clip it."}
           </p>
+
+          {/* Mode toggle: single video URL vs whole channel */}
+          <div className="mb-4 inline-flex rounded-xl border border-white/10 bg-white/[0.04] p-1">
+            <button
+              type="button"
+              onClick={() => setMode("url")}
+              className={`rounded-lg px-4 py-1.5 text-sm font-medium transition-all ${
+                mode === "url"
+                  ? "bg-gradient-to-r from-red-600 to-purple-600 text-white shadow"
+                  : "text-gray-400 hover:text-white"
+              }`}
+            >
+              Video URL
+            </button>
+            <button
+              type="button"
+              onClick={() => setMode("channel")}
+              className={`rounded-lg px-4 py-1.5 text-sm font-medium transition-all ${
+                mode === "channel"
+                  ? "bg-gradient-to-r from-red-600 to-purple-600 text-white shadow"
+                  : "text-gray-400 hover:text-white"
+              }`}
+            >
+              Channel
+            </button>
+          </div>
 
           {/* Clip length selector — applied to the analysis below */}
           <div className="mb-4 flex flex-wrap items-center gap-3">
@@ -397,33 +523,108 @@ function AppPage() {
             </div>
           </div>
 
-          <form onSubmit={handleAnalyze} className="flex gap-3">
-            <input
-              type="text"
-              value={url}
-              onChange={(e) => setUrl(e.target.value)}
-              placeholder="Paste a YouTube URL..."
-              className="flex-1 rounded-xl border border-white/10 bg-white/[0.05] px-5 py-3.5 text-white placeholder-gray-500 outline-none transition-all focus:border-red-500/50 focus:bg-white/[0.08]"
-            />
-            <button
-              type="submit"
-              disabled={state.kind === "loading" || !url.trim()}
-              className="inline-flex items-center gap-2 rounded-xl bg-gradient-to-r from-red-600 to-purple-600 px-6 py-3.5 font-semibold text-white shadow-lg shadow-red-600/20 transition-all hover:from-red-500 hover:to-purple-500 active:scale-95 disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              {state.kind === "loading" ? (
-                <>
-                  <Spinner />
-                  Analyzing...
-                </>
-              ) : (
-                <>
-                  <SearchIcon />
-                  Analyze Video
-                </>
-              )}
-            </button>
-          </form>
+          {mode === "url" ? (
+            <form onSubmit={handleAnalyze} className="flex gap-3">
+              <input
+                type="text"
+                value={url}
+                onChange={(e) => setUrl(e.target.value)}
+                placeholder="Paste a YouTube URL..."
+                className="flex-1 rounded-xl border border-white/10 bg-white/[0.05] px-5 py-3.5 text-white placeholder-gray-500 outline-none transition-all focus:border-red-500/50 focus:bg-white/[0.08]"
+              />
+              <button
+                type="submit"
+                disabled={state.kind === "loading" || !url.trim()}
+                className="inline-flex items-center gap-2 rounded-xl bg-gradient-to-r from-red-600 to-purple-600 px-6 py-3.5 font-semibold text-white shadow-lg shadow-red-600/20 transition-all hover:from-red-500 hover:to-purple-500 active:scale-95 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {state.kind === "loading" ? (
+                  <>
+                    <Spinner />
+                    Analyzing...
+                  </>
+                ) : (
+                  <>
+                    <SearchIcon />
+                    Analyze Video
+                  </>
+                )}
+              </button>
+            </form>
+          ) : (
+            <form onSubmit={handleChannelSubmit} className="flex gap-3">
+              <input
+                type="text"
+                value={channelQuery}
+                onChange={(e) => setChannelQuery(e.target.value)}
+                placeholder="Channel handle or URL (e.g. @MrBeast)..."
+                className="flex-1 rounded-xl border border-white/10 bg-white/[0.05] px-5 py-3.5 text-white placeholder-gray-500 outline-none transition-all focus:border-red-500/50 focus:bg-white/[0.08]"
+              />
+              <button
+                type="submit"
+                disabled={
+                  channelState.kind === "loading" || !channelQuery.trim()
+                }
+                className="inline-flex items-center gap-2 rounded-xl bg-gradient-to-r from-red-600 to-purple-600 px-6 py-3.5 font-semibold text-white shadow-lg shadow-red-600/20 transition-all hover:from-red-500 hover:to-purple-500 active:scale-95 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {channelState.kind === "loading" ? (
+                  <>
+                    <Spinner />
+                    Loading...
+                  </>
+                ) : (
+                  <>
+                    <ChannelIcon />
+                    Load Videos
+                  </>
+                )}
+              </button>
+            </form>
+          )}
         </section>
+
+        {/* ── Channel Mode: loading / error / video list ── */}
+        {mode === "channel" && channelState.kind === "loading" && (
+          <div className="flex flex-col items-center gap-4 py-16">
+            <div className="h-10 w-10 animate-spin rounded-full border-3 border-red-500/30 border-t-red-500" />
+            <p className="text-gray-400">Loading channel videos...</p>
+          </div>
+        )}
+
+        {mode === "channel" && channelState.kind === "error" && (
+          <div className="rounded-2xl border border-red-500/20 bg-red-500/5 p-8 text-center">
+            <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-full bg-red-500/10">
+              <AlertIcon />
+            </div>
+            <h2 className="mb-2 text-xl font-semibold">Could not load channel</h2>
+            <p className="text-gray-400">{channelState.message}</p>
+            {channelState.notConnected ? (
+              <a
+                href="/api/auth/youtube"
+                className="mt-6 inline-flex items-center gap-2 rounded-lg bg-[#FF0000] px-5 py-2.5 text-sm font-semibold text-white transition-all hover:bg-[#E00000] active:scale-95"
+              >
+                <YouTubeIcon />
+                Connect YouTube
+              </a>
+            ) : (
+              <button
+                onClick={() => setChannelState({ kind: "idle" })}
+                className="mt-6 text-sm font-medium text-red-400 transition-colors hover:text-red-300"
+              >
+                Try a different channel
+              </button>
+            )}
+          </div>
+        )}
+
+        {mode === "channel" && channelState.kind === "success" && (
+          <ChannelSection
+            channel={channelState.channel}
+            videos={channelState.videos}
+            analyzing={state.kind === "loading"}
+            onPick={handlePickVideo}
+            onRefresh={() => loadChannelVideos(true)}
+          />
+        )}
 
         {/* ── Loading State ── */}
         {state.kind === "loading" && (
@@ -467,6 +668,100 @@ function AppPage() {
         )}
       </main>
     </div>
+  );
+}
+
+/* ─────────────────────────────────────────────
+   Channel Section
+   ───────────────────────────────────────────── */
+
+function ChannelSection({
+  channel,
+  videos,
+  analyzing,
+  onPick,
+  onRefresh,
+}: {
+  channel: ChannelInfo;
+  videos: ChannelVideoItem[];
+  analyzing: boolean;
+  onPick: (videoId: string) => void;
+  onRefresh: () => void;
+}) {
+  return (
+    <section>
+      {/* Channel header + refresh */}
+      <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-center gap-3">
+          {channel.thumbnailUrl && (
+            <img
+              src={channel.thumbnailUrl}
+              alt=""
+              className="h-10 w-10 rounded-full border border-white/10"
+            />
+          )}
+          <div>
+            <h2 className="text-lg font-semibold text-white">
+              {channel.title}
+            </h2>
+            <p className="text-xs text-gray-500">
+              {videos.length} recent videos — pick one to clip
+            </p>
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={onRefresh}
+          disabled={analyzing}
+          className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs font-medium text-gray-400 transition-all hover:border-white/20 hover:text-white active:scale-95 disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          <RefreshIcon />
+          Refresh
+        </button>
+      </div>
+
+      {/* Video grid */}
+      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+        {videos.map((v) => (
+          <div
+            key={v.videoId}
+            className="flex flex-col overflow-hidden rounded-2xl border border-white/5 bg-white/[0.02] transition-all hover:border-red-500/20 hover:bg-white/[0.04]"
+          >
+            <div className="relative aspect-video w-full overflow-hidden bg-black/40">
+              <img
+                src={v.thumbnailUrl}
+                alt={v.title}
+                loading="lazy"
+                className="h-full w-full object-cover"
+                onError={(e) => {
+                  const img = e.target as HTMLImageElement;
+                  if (!img.src.includes("hqdefault")) {
+                    img.src = `https://img.youtube.com/vi/${v.videoId}/hqdefault.jpg`;
+                  }
+                }}
+              />
+            </div>
+            <div className="flex flex-1 flex-col gap-3 p-4">
+              <h3 className="line-clamp-2 text-sm font-medium leading-snug text-white">
+                {v.title}
+              </h3>
+              <p className="text-xs text-gray-500">
+                {formatChannelDate(v.publishedAt)}
+              </p>
+              <button
+                type="button"
+                onClick={() => onPick(v.videoId)}
+                disabled={analyzing}
+                className="mt-auto inline-flex items-center justify-center gap-2 rounded-lg border border-white/10 bg-white/[0.05] px-4 py-2 text-sm font-medium text-white transition-all hover:border-red-500/30 hover:bg-red-500/10 hover:text-red-400 active:scale-95 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <ScissorsIcon />
+                Analyze & Clip
+              </button>
+            </div>
+          </div>
+        ))}
+      </div>
+    </section>
   );
 }
 
@@ -906,6 +1201,60 @@ function SearchIcon() {
         strokeLinecap="round"
         strokeLinejoin="round"
         d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"
+      />
+    </svg>
+  );
+}
+
+function ChannelIcon() {
+  return (
+    <svg
+      className="h-5 w-5"
+      fill="none"
+      viewBox="0 0 24 24"
+      stroke="currentColor"
+      strokeWidth={2}
+    >
+      <path
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        d="M15 19.128a9.38 9.38 0 002.625.372 9.337 9.337 0 004.121-.952 4.125 4.125 0 00-7.533-2.493M15 19.128v-.003c0-1.113-.285-2.16-.786-3.07M15 19.128v.106A12.318 12.318 0 018.624 21c-2.331 0-4.512-.645-6.374-1.766l-.001-.109a6.375 6.375 0 0111.964-3.07M12 6.375a3.375 3.375 0 11-6.75 0 3.375 3.375 0 016.75 0zm8.25 2.25a2.625 2.625 0 11-5.25 0 2.625 2.625 0 015.25 0z"
+      />
+    </svg>
+  );
+}
+
+function RefreshIcon() {
+  return (
+    <svg
+      className="h-3.5 w-3.5"
+      fill="none"
+      viewBox="0 0 24 24"
+      stroke="currentColor"
+      strokeWidth={2}
+    >
+      <path
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0l3.181 3.183a8.25 8.25 0 0013.803-3.7M4.031 9.865a8.25 8.25 0 0113.803-3.7l3.181 3.182"
+      />
+    </svg>
+  );
+}
+
+function ScissorsIcon() {
+  return (
+    <svg
+      className="h-4 w-4"
+      fill="none"
+      viewBox="0 0 24 24"
+      stroke="currentColor"
+      strokeWidth={2}
+    >
+      <path
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        d="M7.848 8.25l1.536.887M7.848 8.25a3 3 0 11-4.121-4.121 3 3 0 014.121 4.121zm0 7.5l1.536-.887m-1.536.887a3 3 0 11-4.121 4.121 3 3 0 014.121-4.121zm8.616-2.016l-5.294-3.055m5.294 3.055l5.294-3.055m-5.294 3.055v.002a3.375 3.375 0 11-6.75 0 3.375 3.375 0 016.75 0zm0-6.106v-.002a3.375 3.375 0 11-6.75 0 3.375 3.375 0 016.75 0z"
       />
     </svg>
   );
