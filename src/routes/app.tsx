@@ -13,6 +13,12 @@ interface ClipSuggestion {
   description: string;
   viralScore: number;
   transcriptSnippet: string;
+  /**
+   * Transcript segments overlapping [startTime, endTime] (source-relative,
+   * start/duration unchanged). Sent to the upload pipeline so the Short
+   * can be encoded with burned-in captions.
+   */
+  captions: TranscriptSegment[];
 }
 
 interface AnalysisResult {
@@ -271,6 +277,7 @@ function analyzeViralMoments(
       description,
       viralScore: Math.min(100, Math.round(cand.score)),
       transcriptSnippet: windowText.slice(0, 200) + "...",
+      captions: windowSegs.map((s) => ({ text: s.text, start: s.start, duration: s.duration })),
     });
 
     usedRanges.push([startTime, endTime]);
@@ -981,6 +988,9 @@ function ResultsSection({
             endTime: clip.endTime,
             title: clip.title,
             description: clip.description,
+            // Caption segments for this clip time window (optional;
+            // the server burns them in when present).
+            segments: clip.captions ?? [],
           }),
         });
 
