@@ -4,27 +4,22 @@ import { useState, useEffect, useCallback } from "react";
 import type { YouTubeChannel } from "~/lib/youtube-auth";
 import { fetchTranscript } from "~/lib/transcript";
 import type { TranscriptSegment } from "~/lib/transcript";
-
-interface ClipSuggestion {
-  startTime: number;
-  endTime: number;
-  duration: number;
-  title: string;
-  description: string;
-  viralScore: number;
-  transcriptSnippet: string;
-  /**
-   * Transcript segments overlapping [startTime, endTime] (source-relative,
-   * start/duration unchanged). Sent to the upload pipeline so the Short
-   * can be encoded with burned-in captions.
-   */
-  captions: TranscriptSegment[];
-}
+import {
+  analyzeViralMoments,
+  CLIP_LENGTHS,
+  DEFAULT_CLIP_LENGTH,
+  normalizeClipLength,
+  type ClipLength,
+  type ClipSuggestion,
+} from "~/lib/viral-analysis";
 
 interface AnalysisResult {
   videoTitle: string;
   videoId: string;
   thumbnailUrl: string;
+  /** Video length in seconds (end of the last transcript segment). Used to
+   *  clamp per-clip re-lengthing client-side. */
+  videoDuration: number;
   clips: ClipSuggestion[];
 }
 
@@ -46,14 +41,14 @@ const analyzeVideo = createServerFn({ method: "POST" })
     if (typeof data !== "object" || data === null || !("url" in data)) {
       throw new Error("URL is required");
     }
-    const d = data as { url: string };
+    const d = data as { url: string; clipLength?: unknown };
     if (!d.url || typeof d.url !== "string" || d.url.trim().length === 0) {
       throw new Error("URL is required");
     }
-    return { url: d.url.trim() };
+    return { url: d.url.trim(), clipLength: normalizeClipLength(d.clipLength) };
   })
   .handler(async ({ data }): Promise<AnalysisResult> => {
-    const { url } = data;
+    const { url, clipLength } = data;
 
     // 1. Parse YouTube URL
     const videoId = parseYouTubeId(url);
@@ -83,8 +78,8 @@ const analyzeVideo = createServerFn({ method: "POST" })
       throw new Error("Transcript too short for analysis. Try a longer video.");
     }
 
-    // 3. Analyze for viral moments
-    const clips = analyzeViralMoments(segments);
+    // 3. Analyze for viral moments, snapped to the requested clip length
+    const clips = analyzeViralMoments(segments, clipLength);
 
     if (clips.length === 0) {
       throw new Error("Could not identify clear viral moments in this video.");
@@ -97,6 +92,9 @@ const analyzeVideo = createServerFn({ method: "POST" })
       videoTitle: metadata.title,
       videoId,
       thumbnailUrl: `https://img.youtube.com/vi/${videoId}/maxresdefault.jpg`,
+      videoDuration:
+        segments[segments.length - 1].start +
+        segments[segments.length - 1].duration,
       clips,
     };
   });
@@ -165,500 +163,6 @@ async function fetchVideoMetadata(
 }
 
 /* ─────────────────────────────────────────────
-   Viral Moment Analysis
-   ───────────────────────────────────────────── */
-
-function analyzeViralMoments(
-  segments: TranscriptSegment[]
-): ClipSuggestion[] {
-  const WINDOW_SEC = 50; // look at 50-second windows
-  const STEP_SEC = 12; // slide by 12 seconds
-  const MIN_DURATION = 22; // minimum clip length
-  const MAX_DURATION = 65; // maximum clip length
-  const MAX_CLIPS = 5;
-
-  // Combine full text for topic extraction
-  const fullText = segments.map((s) => s.text).join(" ");
-
-  interface WindowCandidate {
-    startIdx: number;
-    endIdx: number;
-    score: number;
-  }
-
-  const candidates: WindowCandidate[] = [];
-
-  for (let i = 0; i < segments.length; i++) {
-    const windowStart = segments[i].start;
-    const windowEnd = windowStart + WINDOW_SEC;
-
-    // Find all segments in this window
-    let endIdx = i;
-    while (
-      endIdx < segments.length &&
-      segments[endIdx].start < windowEnd
-    ) {
-      endIdx++;
-    }
-
-    const windowSegs = segments.slice(i, endIdx);
-    if (windowSegs.length < 3) continue;
-
-    const actualDuration =
-      windowSegs[windowSegs.length - 1].start +
-      windowSegs[windowSegs.length - 1].duration -
-      windowStart;
-
-    if (actualDuration < MIN_DURATION || actualDuration > MAX_DURATION) continue;
-
-    const windowText = windowSegs.map((s) => s.text).join(" ");
-    const score = scoreWindow(windowText, windowSegs, actualDuration);
-
-    candidates.push({ startIdx: i, endIdx, score });
-
-    // Step forward
-    i += Math.max(1, Math.floor(STEP_SEC / 5)); // rough step
-  }
-
-  if (candidates.length === 0) {
-    // Fallback: take first, middle, and last chunks
-    const chunkSize = Math.ceil(segments.length / MAX_CLIPS);
-    for (let c = 0; c < MAX_CLIPS; c++) {
-      const startIdx = c * chunkSize;
-      const endIdx = Math.min(startIdx + chunkSize, segments.length);
-      if (endIdx - startIdx < 3) continue;
-
-      const windowSegs = segments.slice(startIdx, endIdx);
-      const windowText = windowSegs.map((s) => s.text).join(" ");
-      const startTime = segments[startIdx].start;
-      const endTime =
-        segments[endIdx - 1].start + segments[endIdx - 1].duration;
-      const duration = endTime - startTime;
-
-      candidates.push({
-        startIdx,
-        endIdx,
-        score: 50 + Math.random() * 20, // random baseline
-      });
-    }
-  }
-
-  // Sort by score descending
-  candidates.sort((a, b) => b.score - a.score);
-
-  // Pick top clips, avoiding overlaps
-  const selected: ClipSuggestion[] = [];
-  const usedRanges: Array<[number, number]> = [];
-
-  for (const cand of candidates) {
-    if (selected.length >= MAX_CLIPS) break;
-
-    const windowSegs = segments.slice(cand.startIdx, cand.endIdx);
-    const startTime = segments[cand.startIdx].start;
-    const endTime =
-      segments[cand.endIdx - 1].start + segments[cand.endIdx - 1].duration;
-    const duration = Math.round(endTime - startTime);
-
-    // Check overlap with already selected
-    const overlaps = usedRanges.some(
-      ([s, e]) => startTime < e && endTime > s
-    );
-    if (overlaps) continue;
-
-    const windowText = windowSegs.map((s) => s.text).join(" ");
-    const title = generateTitle(windowText, windowSegs);
-    const description = generateDescription(windowText, fullText, duration);
-
-    selected.push({
-      startTime,
-      endTime,
-      duration,
-      title,
-      description,
-      viralScore: Math.min(100, Math.round(cand.score)),
-      transcriptSnippet: windowText.slice(0, 200) + "...",
-      captions: windowSegs.map((s) => ({ text: s.text, start: s.start, duration: s.duration })),
-    });
-
-    usedRanges.push([startTime, endTime]);
-  }
-
-  return selected;
-}
-
-/* ─────────────────────────────────────────────
-   Scoring Algorithm
-   ───────────────────────────────────────────── */
-
-// Words/phrases that indicate a strong hook (first few seconds of a clip)
-const HOOK_PATTERNS = [
-  /\b(this|here'?s|watch|look|see|check)\b/i,
-  /\b(secret|trick|hack|never|always|worst|best|insane|crazy|shocking)\b/i,
-  /\b(did you know|what if|imagine|stop|wait)\b/i,
-  /\b(you need to|you have to|you must|everyone|nobody)\b/i,
-  /\b(why|how|when|where|who)\b.+\?/i,
-  /\b(exposed|truth|real reason|nobody talks about)\b/i,
-];
-
-// Words indicating emotional peaks
-const EMOTION_WORDS = [
-  "amazing",
-  "incredible",
-  "unbelievable",
-  "terrible",
-  "horrible",
-  "awesome",
-  "insane",
-  "crazy",
-  "wild",
-  "ridiculous",
-  "hilarious",
-  "brilliant",
-  "genius",
-  "stunning",
-  "breathtaking",
-  "disgusting",
-  "outrageous",
-  "devastating",
-  "spectacular",
-  "extraordinary",
-  "mind-blowing",
-  "game-changing",
-  "life-changing",
-  "unprecedented",
-  "massive",
-  "huge",
-  "enormous",
-  "insane",
-];
-
-// Words indicating information density / value
-const INFO_DENSITY_WORDS = [
-  "actually",
-  "basically",
-  "essentially",
-  "specifically",
-  "importantly",
-  "crucial",
-  "critical",
-  "key",
-  "fundamental",
-  "research",
-  "study",
-  "data",
-  "evidence",
-  "proven",
-  "discovered",
-  "found",
-  "revealed",
-  "according to",
-  "scientists",
-  "experts",
-  "years",
-  "percent",
-  "million",
-  "billion",
-  "thousand",
-  "dollars",
-];
-
-// Strong closing/punchline phrases
-const PUNCHLINE_PATTERNS = [
-  /\b(that'?s why|that'?s how|and that'?s|so yeah|there you go|boom)\b/i,
-  /\b(mind blown|blew my mind|changed everything|game over)\b/i,
-  /\b(remember that|don'?t forget|mark my words|trust me)\b/i,
-  /\b(let that sink in|think about that|wrap your head around)\b/i,
-];
-
-function scoreWindow(
-  text: string,
-  segs: TranscriptSegment[],
-  duration: number
-): number {
-  let score = 0;
-
-  // 1. Hook score (first ~5 seconds of the window)
-  const first5Words = segs.slice(0, 3).map((s) => s.text).join(" ");
-  for (const pattern of HOOK_PATTERNS) {
-    if (pattern.test(first5Words)) {
-      score += 18;
-      break;
-    }
-  }
-
-  // Check if the clip starts with a question
-  if (segs.length > 0 && segs[0].text.trim().endsWith("?")) {
-    score += 12;
-  }
-
-  // 2. Information density score
-  const words = text.split(/\s+/);
-  const wordCount = words.length;
-  if (wordCount === 0) return score;
-
-  // Count info-dense words
-  let infoHits = 0;
-  for (const w of INFO_DENSITY_WORDS) {
-    const regex = new RegExp(`\\b${w}\\b`, "gi");
-    const matches = text.match(regex);
-    if (matches) infoHits += matches.length;
-  }
-  const infoDensity = (infoHits / wordCount) * 100;
-  score += Math.min(25, infoDensity * 8);
-
-  // Count numbers / statistics
-  const numberMatches = text.match(/\d+(\.\d+)?/g);
-  if (numberMatches) {
-    score += Math.min(15, numberMatches.length * 4);
-  }
-
-  // 3. Emotional peaks
-  let emotionHits = 0;
-  for (const w of EMOTION_WORDS) {
-    const regex = new RegExp(`\\b${w}\\b`, "gi");
-    const matches = text.match(regex);
-    if (matches) emotionHits += matches.length;
-  }
-  score += Math.min(20, emotionHits * 6);
-
-  // Exclamation marks indicate strong emotion
-  const exclamCount = (text.match(/!/g) || []).length;
-  score += Math.min(10, exclamCount * 3);
-
-  // 4. Question density (engagement)
-  const questionCount = (text.match(/\?/g) || []).length;
-  score += Math.min(8, questionCount * 2);
-
-  // 5. Punchline/conclusion score (last ~5 seconds)
-  const lastSegs = segs.slice(-3);
-  const lastText = lastSegs.map((s) => s.text).join(" ");
-  for (const pattern of PUNCHLINE_PATTERNS) {
-    if (pattern.test(lastText)) {
-      score += 15;
-      break;
-    }
-  }
-
-  // 6. Duration bonus — sweet spot is 30-55 seconds for Shorts
-  if (duration >= 30 && duration <= 55) {
-    score += 12;
-  } else if (duration >= 25 && duration <= 60) {
-    score += 8;
-  }
-
-  // 7. Structural completeness — has clear beginning, middle, end
-  // (approximated by having segments spread across the window)
-  if (segs.length >= 5 && duration >= 28) {
-    score += 6;
-  }
-
-  // Base randomness to differentiate similar clips
-  score += Math.random() * 8;
-
-  return score;
-}
-
-/* ─────────────────────────────────────────────
-   Title & Description Generation
-   ───────────────────────────────────────────── */
-
-const TITLE_TEMPLATES = [
-  (subject: string, topic: string) =>
-    `The moment ${subject} revealed the truth about ${topic}`,
-  (subject: string, topic: string) =>
-    `${subject} explains why ${topic} is a game-changer`,
-  (_s: string, topic: string) =>
-    `You need to hear this about ${topic} 💡`,
-  (_s: string, topic: string) =>
-    `This ${topic} changed how I think forever`,
-  (subject: string, topic: string) =>
-    `${subject} just exposed everything about ${topic}`,
-  (_s: string, topic: string) =>
-    `Why everyone is wrong about ${topic}`,
-  (subject: string, _t: string) =>
-    `${subject} dropped some serious knowledge 🔥`,
-  (_s: string, topic: string) =>
-    `The ${topic} secret nobody talks about`,
-  (subject: string, topic: string) =>
-    `${subject} on ${topic}: mind = blown 🤯`,
-  (subject: string, _t: string) =>
-    `${subject} said what we were all thinking`,
-  (_s: string, topic: string) =>
-    `Stop scrolling — this ${topic} take is wild`,
-  (subject: string, topic: string) =>
-    `${subject}'s hot take on ${topic} is going viral`,
-];
-
-// Emojis for variety
-const EMOJIS = ["🔥", "💡", "🤯", "😱", "💯", "🚀", "⚡", "🎯", "👀", "🧠"];
-
-function generateTitle(
-  windowText: string,
-  _segs: TranscriptSegment[]
-): string {
-  // Extract key subject and topic
-  const { subject, topic } = extractSubjectTopic(windowText);
-
-  // Pick a random template
-  const template =
-    TITLE_TEMPLATES[Math.floor(Math.random() * TITLE_TEMPLATES.length)];
-  let title = template(subject, topic);
-
-  // Ensure max 60 chars
-  if (title.length > 60) {
-    title = title.slice(0, 57) + "...";
-  }
-
-  return title;
-}
-
-function extractSubjectTopic(text: string): {
-  subject: string;
-  topic: string;
-} {
-  // Try to find "X about Y" or "X is Y" patterns
-  const words = text.split(/\s+/);
-  const properNouns: string[] = [];
-
-  for (const w of words) {
-    const clean = w.replace(/[^a-zA-Z0-9]/g, "");
-    if (clean.length > 2 && /^[A-Z][a-z]/.test(clean)) {
-      properNouns.push(clean);
-    }
-  }
-
-  // Common nouns that work well as topics
-  const topicKeywords = [
-    "AI",
-    "money",
-    "success",
-    "failure",
-    "business",
-    "life",
-    "productivity",
-    "health",
-    "mindset",
-    "growth",
-    "marketing",
-    "content",
-    "creativity",
-    "happiness",
-    "wealth",
-    "learning",
-    "habit",
-    "routine",
-    "strategy",
-    "mistake",
-    "opportunity",
-    "truth",
-    "reality",
-    "future",
-    "mind",
-  ];
-
-  let topic = "this";
-  for (const kw of topicKeywords) {
-    if (text.toLowerCase().includes(kw.toLowerCase())) {
-      topic = kw;
-      break;
-    }
-  }
-
-  // If no keyword found, use a meaningful word from the text
-  if (topic === "this") {
-    const meaningful = words.find(
-      (w) =>
-        w.replace(/[^a-zA-Z]/g, "").length > 4 &&
-        !["this", "that", "there", "about", "their", "would", "could", "should"].includes(
-          w.toLowerCase().replace(/[^a-zA-Z]/g, "")
-        )
-    );
-    if (meaningful) {
-      topic = meaningful.replace(/[^a-zA-Z]/g, "").toLowerCase();
-    }
-  }
-
-  let subject = "They";
-  if (properNouns.length > 0) {
-    subject = properNouns[0];
-  } else {
-    // Extract a subject-like word
-    const subjectCandidates = words.filter(
-      (w) =>
-        w.replace(/[^a-zA-Z]/g, "").length > 3 &&
-        w === w.replace(/[^a-zA-Z]/g, "") &&
-        !["this", "that", "there", "about", "their", "would", "could", "should"].includes(
-          w.toLowerCase()
-        )
-    );
-    if (subjectCandidates.length > 0) {
-      subject =
-        subjectCandidates[Math.floor(Math.random() * subjectCandidates.length)];
-      subject = subject.charAt(0).toUpperCase() + subject.slice(1);
-    }
-  }
-
-  return { subject, topic };
-}
-
-function generateDescription(
-  windowText: string,
-  _fullText: string,
-  _duration: number
-): string {
-  // Extract hashtags from key terms
-  const hashtags = generateHashtags(windowText);
-
-  // Generate a short description
-  const firstSentence =
-    windowText.split(/[.!?]/)[0]?.trim().slice(0, 100) || "";
-
-  const description = `${firstSentence}...\n\n${hashtags}`;
-  return description;
-}
-
-function generateHashtags(text: string): string {
-  const lower = text.toLowerCase();
-
-  const tagMap: Record<string, string> = {
-    money: "#money",
-    business: "#business",
-    success: "#success",
-    life: "#life",
-    productivity: "#productivity",
-    mindset: "#mindset",
-    growth: "#growth",
-    marketing: "#marketing",
-    content: "#content",
-    ai: "#ai",
-    health: "#health",
-    learning: "#learning",
-    strategy: "#strategy",
-    future: "#future",
-    tech: "#tech",
-    startup: "#startup",
-    motivation: "#motivation",
-    inspiration: "#inspiration",
-    creativity: "#creativity",
-  };
-
-  const matched: string[] = [];
-  for (const [key, tag] of Object.entries(tagMap)) {
-    if (lower.includes(key) && !matched.includes(tag)) {
-      matched.push(tag);
-    }
-  }
-
-  // Always include some generic ones
-  const genericTags = ["#shorts", "#viral", "#clipflow", "#youtube"];
-  const tags = [...matched, ...genericTags];
-
-  // Deduplicate & limit to 5
-  const unique = [...new Set(tags)].slice(0, 5);
-  return unique.join(" ");
-}
-
-/* ─────────────────────────────────────────────
    Helpers
    ───────────────────────────────────────────── */
 
@@ -680,13 +184,6 @@ function viralScoreColor(score: number): string {
   if (score >= 70) return "from-orange-500 to-red-500";
   if (score >= 55) return "from-yellow-500 to-orange-500";
   return "from-gray-500 to-gray-400";
-}
-
-function viralScoreLabel(score: number): string {
-  if (score >= 85) return "🔥 Viral";
-  if (score >= 70) return "🔥 Hot";
-  if (score >= 55) return "⚡ Good";
-  return "👀 Decent";
 }
 
 function viralScoreFlames(score: number): number {
@@ -719,6 +216,7 @@ type AppState =
 
 function AppPage() {
   const [url, setUrl] = useState("");
+  const [clipLength, setClipLength] = useState<ClipLength>(DEFAULT_CLIP_LENGTH);
   const [state, setState] = useState<AppState>({ kind: "idle" });
   const [connection, setConnection] = useState<ConnectionInfo>({
     connected: false,
@@ -767,7 +265,9 @@ function AppPage() {
     setState({ kind: "loading" });
 
     try {
-      const result = await analyzeVideo({ data: { url: url.trim() } });
+      const result = await analyzeVideo({
+        data: { url: url.trim(), clipLength },
+      });
       setState({ kind: "success", result });
     } catch (err) {
       const message =
@@ -874,6 +374,29 @@ function AppPage() {
             suggest ready-to-clip Shorts.
           </p>
 
+          {/* Clip length selector — applied to the analysis below */}
+          <div className="mb-4 flex flex-wrap items-center gap-3">
+            <span className="text-sm font-medium text-gray-400">
+              Clip length
+            </span>
+            <div className="inline-flex rounded-xl border border-white/10 bg-white/[0.04] p-1">
+              {CLIP_LENGTHS.map((len) => (
+                <button
+                  key={len}
+                  type="button"
+                  onClick={() => setClipLength(len)}
+                  className={`rounded-lg px-4 py-1.5 text-sm font-medium transition-all ${
+                    clipLength === len
+                      ? "bg-gradient-to-r from-red-600 to-purple-600 text-white shadow"
+                      : "text-gray-400 hover:text-white"
+                  }`}
+                >
+                  {len}s
+                </button>
+              ))}
+            </div>
+          </div>
+
           <form onSubmit={handleAnalyze} className="flex gap-3">
             <input
               type="text"
@@ -960,14 +483,33 @@ function ResultsSection({
   isConnected: boolean;
   onReset: () => void;
 }) {
+  // Local copy of the clips so per-clip re-lengthing can re-snap endTime
+  // client-side without re-running the analysis.
+  const [clips, setClips] = useState<ClipSuggestion[]>(() => result.clips);
   // Per-clip upload states — initialized to idle
   const [uploadStates, setUploadStates] = useState<ClipUploadState[]>(
     () => result.clips.map(() => ({ status: "idle" }))
   );
 
+  /** Re-snap a single clip to a new length: endTime = startTime + N,
+   *  clamped to the video length. Upload uses startTime/endTime, so the
+   *  pipeline picks this up with no backend change. */
+  const handleRelength = useCallback(
+    (clipIndex: number, length: ClipLength) => {
+      setClips((prev) =>
+        prev.map((c, i) => {
+          if (i !== clipIndex) return c;
+          const endTime = Math.min(c.startTime + length, result.videoDuration);
+          return { ...c, endTime, duration: Math.round(endTime - c.startTime) };
+        })
+      );
+    },
+    [result.videoDuration]
+  );
+
   const handleUpload = useCallback(
     async (clipIndex: number) => {
-      const clip = result.clips[clipIndex];
+      const clip = clips[clipIndex];
       if (!clip) return;
 
       // Set this clip to uploading
@@ -1044,7 +586,7 @@ function ResultsSection({
         });
       }
     },
-    [result.clips, result.videoId]
+    [clips, result.videoId]
   );
 
   const handleRetry = useCallback(
@@ -1083,7 +625,7 @@ function ResultsSection({
           <p className="text-gray-400">
             We found{" "}
             <span className="font-semibold text-white">
-              {result.clips.length} viral moments
+              {clips.length} viral moments
             </span>{" "}
             ready to clip as Shorts.
           </p>
@@ -1101,7 +643,7 @@ function ResultsSection({
         Suggested Shorts Clips
       </h3>
       <div className="space-y-5">
-        {result.clips.map((clip, i) => (
+        {clips.map((clip, i) => (
           <ClipCard
             key={i}
             clip={clip}
@@ -1110,6 +652,7 @@ function ResultsSection({
             uploadState={uploadStates[i] || { status: "idle" }}
             onUpload={() => handleUpload(i)}
             onRetry={() => handleRetry(i)}
+            onRelength={(length) => handleRelength(i, length)}
           />
         ))}
       </div>
@@ -1128,6 +671,7 @@ function ClipCard({
   uploadState,
   onUpload,
   onRetry,
+  onRelength,
 }: {
   clip: ClipSuggestion;
   index: number;
@@ -1135,6 +679,7 @@ function ClipCard({
   uploadState: ClipUploadState;
   onUpload: () => void;
   onRetry: () => void;
+  onRelength?: (length: ClipLength) => void;
 }) {
   const flames = viralScoreFlames(clip.viralScore);
   const scoreColor = viralScoreColor(clip.viralScore);
@@ -1204,6 +749,34 @@ function ClipCard({
               {clip.transcriptSnippet}
             </p>
           </details>
+
+          {/* Per-clip re-length — re-snaps this clip client-side */}
+          {onRelength && (
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-[11px] uppercase tracking-wide text-gray-600">
+                Re-length
+              </span>
+              <div className="inline-flex rounded-lg border border-white/10 bg-white/[0.04] p-0.5">
+                {CLIP_LENGTHS.map((len) => {
+                  const active = clip.duration === len;
+                  return (
+                    <button
+                      key={len}
+                      type="button"
+                      onClick={() => onRelength(len)}
+                      className={`rounded-md px-2 py-1 text-[11px] font-medium transition-all ${
+                        active
+                          ? "bg-white/[0.12] text-white"
+                          : "text-gray-500 hover:text-white"
+                      }`}
+                    >
+                      {len}s
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
 
           {/* Upload to YouTube button */}
           {isConnected ? (
