@@ -24,6 +24,13 @@ import { getValidAccessToken } from "./youtube-auth";
    Types
    ───────────────────────────────────────────── */
 
+/** A caption segment as carried on the clip input (source-video-relative). */
+export interface CaptionSegment {
+  text: string;
+  start: number;
+  duration: number;
+}
+
 export interface UploadClipInput {
   /** Start timestamp in seconds */
   startTime: number;
@@ -35,6 +42,12 @@ export interface UploadClipInput {
   description: string;
   /** Full YouTube URL of the source video */
   videoUrl: string;
+  /**
+   * Caption segments overlapping [startTime, endTime], with start/duration
+   * UNCHANGED (relative to the source video, not the clip). Optional: when
+   * absent/empty the clip is encoded without burned-in captions.
+   */
+  segments?: CaptionSegment[];
 }
 
 export interface UploadClipResult {
@@ -155,11 +168,50 @@ export async function uploadClipToYouTube(
       `[ClipFlow] Encoding to vertical 9:16 Shorts format (start=${clipStart}s, dur=${clipDuration}s)`
     );
 
+    // Build the video filter chain. crop+scale first (1080×1920 canvas), then
+    // burn in ASS captions AFTER the scale so text is drawn in the final
+    // 1080×1920 coordinate space (large, readable, correctly positioned).
+    let vfChain = "crop=ih*9/16:ih,scale=1080:1920";
+
+    // Optional burned-in captions: use the transcript segments the client
+    // sent for this clip's time window. Missing/invalid/empty segments are
+    // handled gracefully — the clip encodes WITHOUT subtitles.
+    const captionSegments = normalizeCaptionSegments(input.segments);
+    if (captionSegments.length > 0) {
+      if (await assFilterAvailable()) {
+        const assPath = `${workDir}/clip.ass`;
+        const eventCount = await buildAssFile(
+          captionSegments,
+          clipStart,
+          clipDuration,
+          assPath
+        );
+        if (eventCount > 0) {
+          vfChain += `,ass=${assPath}`;
+          console.log(
+            `[ClipFlow] Burning ${eventCount} caption events into Short (ass=${assPath})`
+          );
+        } else {
+          console.log(
+            "[ClipFlow] No caption segments overlap the clip window — encoding without subtitles"
+          );
+        }
+      } else {
+        console.log(
+          "[ClipFlow] libass subtitles unavailable (no ass filter in ffmpeg) — encoding without subtitles"
+        );
+      }
+    } else {
+      console.log(
+        "[ClipFlow] No transcript segments for this clip — encoding without subtitles"
+      );
+    }
+
     const encodeResult = await Bun.$`ffmpeg \
       -ss ${clipStart} \
       -i ${rawClipPath} \
       -t ${clipDuration} \
-      -vf "crop=ih*9/16:ih,scale=1080:1920" \
+      -vf ${vfChain} \
       -c:v libx264 -preset veryfast -crf 23 \
       -c:a aac -b:a 128k \
       -y \
@@ -1023,6 +1075,202 @@ async function uploadToYouTubeAPI(
     };
   }
 }
+
+/* ─────────────────────────────────────────────
+   Burned-in Captions (ASS)
+   ───────────────────────────────────────────── */
+
+/**
+ * ASS rendering constants for 1080×1920 Shorts captions.
+ * Chosen so captions are large and readable, never overflow the frame, and
+ * sit safely above the bottom UI (progress bar / buttons):
+ *   - Fontsize 78 on a 1080×1920 canvas (≈ big, TikTok-style captions)
+ *   - White text with BorderStyle=1 outline (5px) + shadow (2px) for contrast
+ *   - Alignment=2 (bottom center) with MarginV=160 — clear of the bottom edge
+ *   - WrapStyle=2 (no auto-wrap) + explicit \N wrapping at ≤ 30 chars/line,
+ *     max 2 lines per event, so a caption can never run off the 1080px width
+ */
+const ASS_FONT = "Arial";
+const ASS_FONT_SIZE = 78;
+const ASS_OUTLINE = 5;
+const ASS_SHADOW = 2;
+const ASS_MARGIN_V = 160;
+const ASS_MAX_LINE_CHARS = 30;
+const ASS_MAX_LINES = 2;
+
+/** ffmpeg libass filter availability, checked once per process. */
+let assFilterAvailableCache: boolean | null = null;
+
+async function assFilterAvailable(): Promise<boolean> {
+  if (assFilterAvailableCache !== null) return assFilterAvailableCache;
+  try {
+    const out = await Bun.$`ffmpeg -hide_banner -filters`.quiet().text();
+    assFilterAvailableCache = /\bass\s+V->V\b/.test(out);
+  } catch {
+    assFilterAvailableCache = false;
+  }
+  if (!assFilterAvailableCache) {
+    console.log(
+      "[ClipFlow] ffmpeg has no ass filter (libass missing) — captions will be skipped"
+    );
+  }
+  return assFilterAvailableCache;
+}
+
+/**
+ * Normalize the client-supplied caption segments defensively. Anything that
+ * is not a well-formed {text, start, duration} entry is dropped; a non-array
+ * (undefined, null, garbage) becomes [] so subtitles degrade gracefully.
+ */
+function normalizeCaptionSegments(raw: unknown): CaptionSegment[] {
+  if (!Array.isArray(raw)) return [];
+  const out: CaptionSegment[] = [];
+  for (const s of raw) {
+    if (typeof s !== "object" || s === null) continue;
+    const seg = s as Record<string, unknown>;
+    if (
+      typeof seg.text === "string" &&
+      seg.text.trim().length > 0 &&
+      typeof seg.start === "number" &&
+      Number.isFinite(seg.start) &&
+      typeof seg.duration === "number" &&
+      Number.isFinite(seg.duration)
+    ) {
+      out.push({ text: seg.text, start: seg.start, duration: seg.duration });
+    }
+  }
+  return out;
+}
+
+/**
+ * Escape ASS override-block characters in caption text: `{`/`}` delimit
+ * override blocks and a lone `\` starts a tag, so they must be escaped or
+ * the text would be interpreted as styling (or swallowed entirely). Existing
+ * newlines are collapsed to single spaces (line breaks come from \N only).
+ */
+function escapeAssText(raw: string): string {
+  return raw
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/\\/g, "\\\\")
+    .replace(/\{/g, "\\{")
+    .replace(/\}/g, "\\}");
+}
+
+/**
+ * Wrap caption text into at most ASS_MAX_LINES lines of at most
+ * ASS_MAX_LINE_CHARS characters each, joined with ASS \N breaks, so text can
+ * never overflow the 1080px canvas. Words are packed greedily; a single word
+ * longer than a line is hard-split across lines; anything that does not fit
+ * on the last line is truncated with an ellipsis.
+ */
+function wrapAssText(raw: string): string {
+  const words = raw.split(/\s+/).filter(Boolean);
+  const lines: string[] = [];
+
+  for (let i = 0; i < words.length; i++) {
+    let word = words[i];
+
+    // Unbreakable token longer than a whole line: hard-split it.
+    while (word.length > ASS_MAX_LINE_CHARS && lines.length < ASS_MAX_LINES) {
+      lines.push(word.slice(0, ASS_MAX_LINE_CHARS));
+      word = word.slice(ASS_MAX_LINE_CHARS);
+    }
+    if (word.length === 0) continue;
+
+    const lastIdx = lines.length - 1;
+    const current = lines.length > 0 ? lines[lastIdx] : "";
+    const candidate = current ? `${current} ${word}` : word;
+
+    if (lines.length === 0) {
+      lines.push(word);
+    } else if (candidate.length <= ASS_MAX_LINE_CHARS) {
+      lines[lastIdx] = candidate;
+    } else if (lines.length < ASS_MAX_LINES) {
+      lines.push(word);
+    } else {
+      // Both lines are full — truncate the last line with an ellipsis.
+      lines[lastIdx] = truncateToCodePoints(lines[lastIdx], ASS_MAX_LINE_CHARS - 1) + "…";
+      break;
+    }
+  }
+
+  return lines.join("\\N");
+}
+
+/** ASS timestamp H:MM:SS.cc (centiseconds). */
+function formatAssTime(t: number): string {
+  const cs = Math.max(0, Math.round(t * 100));
+  const h = Math.floor(cs / 360000);
+  const m = Math.floor((cs % 360000) / 6000);
+  const s = Math.floor((cs % 6000) / 100);
+  const c = cs % 100;
+  const pad = (n: number, w: number) => String(n).padStart(w, "0");
+  return `${h}:${pad(m, 2)}:${pad(s, 2)}.${pad(c, 2)}`;
+}
+
+/**
+ * Build an ASS subtitle file for a clip from source-relative caption segments
+ * and write it to `assPath`.
+ *
+ * Timestamps are shifted by -clipStart (so they align with the clip timeline,
+ * which starts at 0 after the ffmpeg -ss cut) and clamped to [0, clipDuration];
+ * segments that fall entirely outside the window are dropped. Returns the
+ * number of Dialogue events written (0 = nothing to render, no file created).
+ */
+export async function buildAssFile(
+  segments: CaptionSegment[],
+  clipStart: number,
+  clipDuration: number,
+  assPath: string
+): Promise<number> {
+  const clipEnd = clipStart + clipDuration;
+  const events: string[] = [];
+
+  for (const seg of segments) {
+    const text = escapeAssText(seg.text);
+    if (!text) continue;
+
+    const segEnd = seg.start + Math.max(0, seg.duration);
+    // Drop segments entirely outside the clip window.
+    if (segEnd <= clipStart || seg.start >= clipEnd) continue;
+
+    let start = Math.max(0, seg.start - clipStart);
+    let end = Math.min(clipDuration, segEnd - clipStart);
+    // ASS needs start < end; guarantee a minimal renderable duration.
+    if (end - start < 0.1) end = Math.min(clipDuration, start + 0.1);
+    if (end <= start) continue;
+
+    const wrapped = wrapAssText(text);
+    if (!wrapped) continue;
+
+    events.push(
+      `Dialogue: 0,${formatAssTime(start)},${formatAssTime(end)},Default,,0,0,0,,${wrapped}`
+    );
+  }
+
+  if (events.length === 0) return 0;
+
+  const ass = `[Script Info]
+ScriptType: v4.00+
+PlayResX: 1080
+PlayResY: 1920
+WrapStyle: 2
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,${ASS_FONT},${ASS_FONT_SIZE},&H00FFFFFF,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,${ASS_OUTLINE},${ASS_SHADOW},2,60,60,${ASS_MARGIN_V},1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+${events.join("\n")}
+`;
+
+  await Bun.write(assPath, ass);
+  return events.length;
+}
+
 
 /* ─────────────────────────────────────────────
    Metadata Sanitization
