@@ -6,7 +6,12 @@
  * Called directly from serve.ts.
  */
 
-import { uploadClipToYouTube, type UploadClipInput, type UploadClipOutcome } from "./youtube-upload";
+import {
+  uploadClip,
+  type UploadClipInput,
+  type UploadClipOutcome,
+  type UploadClipResult,
+} from "./youtube-upload";
 
 export async function handleUploadClip(req: Request): Promise<Response> {
   const headers: Record<string, string> = {
@@ -52,16 +57,25 @@ export async function handleUploadClip(req: Request): Promise<Response> {
       );
     }
 
+    // `destination` is optional and validated in the pipeline
+    // ("youtube" | "tiktok" | "both", default "youtube").
+
     const cookieHeader = req.headers.get("cookie");
 
     // Run the upload pipeline
-    const outcome: UploadClipOutcome = await uploadClipToYouTube(body, cookieHeader);
+    const outcome: UploadClipOutcome = await uploadClip(body, cookieHeader);
 
     if (outcome.success) {
-      return new Response(
-        JSON.stringify(outcome),
-        { status: 200, headers }
-      );
+      const response = new Response(JSON.stringify(outcome), {
+        status: 200,
+        headers,
+      });
+      // Persist a rotated TikTok refresh token if the pipeline refreshed one.
+      const freshCookie = (outcome as UploadClipResult).tiktokFreshCookie;
+      if (freshCookie) {
+        response.headers.append("Set-Cookie", freshCookie);
+      }
+      return response;
     } else {
       // Map error codes to HTTP statuses
       let status = 500;
@@ -77,16 +91,14 @@ export async function handleUploadClip(req: Request): Promise<Response> {
           status = 502;
           break;
         case "UPLOAD_FAILED":
+        case "TIKTOK_FAILED":
           status = 500;
           break;
         default:
           status = 500;
       }
 
-      return new Response(
-        JSON.stringify(outcome),
-        { status, headers }
-      );
+      return new Response(JSON.stringify(outcome), { status, headers });
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : "Invalid request body.";

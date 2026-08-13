@@ -19,6 +19,13 @@
  */
 
 import { getValidAccessToken } from "./youtube-auth";
+import { getValidTikTokToken, tiktokSetupPending } from "./tiktok-auth";
+import { uploadToTikTokAPI } from "./tiktok-upload";
+import {
+  sanitizeDescription,
+  sanitizeTitle,
+  truncateToCodePoints,
+} from "./sanitize";
 
 /* ─────────────────────────────────────────────
    Types
@@ -48,19 +55,66 @@ export interface UploadClipInput {
    * absent/empty the clip is encoded without burned-in captions.
    */
   segments?: CaptionSegment[];
+  /**
+   * Where to publish the clip. Defaults to "youtube" (backward compatible).
+   * "both" uploads the SAME encoded clip to YouTube and TikTok.
+   */
+  destination?: UploadDestination;
 }
+
+export type UploadDestination = "youtube" | "tiktok" | "both";
+
+/** Per-destination outcome used while composing a "both" upload. */
+export type DestinationUploadResult =
+  | { ok: true; kind: "youtube"; videoId: string; videoUrl: string }
+  | { ok: true; kind: "tiktok"; publishId: string; videoUrl?: string };
+
+export interface DestinationUploadError {
+  ok: false;
+  code: UploadClipError["code"] | "TIKTOK_FAILED";
+  error: string;
+}
+
+export type DestinationUploadOutcome =
+  | DestinationUploadResult
+  | DestinationUploadError;
 
 export interface UploadClipResult {
   success: true;
+  /**
+   * Top-level values stay backward compatible: YouTube values when "youtube"
+   * (or "both") is selected; the TikTok publish_id when "tiktok"-only.
+   */
   videoId: string;
   videoUrl: string;
+  destination?: UploadDestination;
+  /** Per-destination results, present when destination === "both". */
+  youtube?: { videoId: string; videoUrl: string };
+  tiktok?: { publishId?: string; videoUrl?: string };
+  /**
+   * Present when a "both" upload partially succeeded (one destination failed
+   * while the other succeeded) — e.g. "TikTok failed: <msg>".
+   */
+  partialError?: string;
+  /**
+   * Set-Cookie value that persists a ROTATED TikTok refresh token (TikTok
+   * refresh tokens are single-use). The HTTP handler must append it.
+   */
+  tiktokFreshCookie?: string;
 }
 
 export interface UploadClipError {
   success: false;
   error: string;
   /** Machine-readable error code for the UI */
-  code: "NO_AUTH" | "MISSING_TOOLS" | "DOWNLOAD_FAILED" | "ENCODE_FAILED" | "UPLOAD_FAILED" | "API_ERROR";
+  code:
+    | "NO_AUTH"
+    | "MISSING_TOOLS"
+    | "DOWNLOAD_FAILED"
+    | "ENCODE_FAILED"
+    | "UPLOAD_FAILED"
+    | "API_ERROR"
+    | "TIKTOK_FAILED";
 }
 
 export type UploadClipOutcome = UploadClipResult | UploadClipError;
@@ -111,20 +165,69 @@ export async function getToolStatus(): Promise<{
    ───────────────────────────────────────────── */
 
 /**
- * Full upload pipeline for a YouTube Shorts clip.
- * Accepts the clip metadata and the request's Cookie header for auth.
+ * Full upload pipeline for a Shorts clip.
+ * Downloads the source, cuts/encodes the vertical 9:16 clip ONCE, then
+ * uploads the SAME encoded file to every selected destination (YouTube,
+ * TikTok, or both). Accepts the clip metadata and the request's Cookie
+ * header for auth.
  */
-export async function uploadClipToYouTube(
+export async function uploadClip(
   input: UploadClipInput,
   cookieHeader: string | null
 ): Promise<UploadClipOutcome> {
-  // ── 1. Authenticate ──
-  const auth = await getValidAccessToken(cookieHeader);
-  if (!auth) {
+  const destination: UploadDestination = input.destination ?? "youtube";
+  // Guard against malformed clients: only youtube/tiktok/both are valid.
+  if (
+    destination !== "youtube" &&
+    destination !== "tiktok" &&
+    destination !== "both"
+  ) {
+    return {
+      success: false,
+      code: "API_ERROR",
+      error: "Invalid destination. Use youtube, tiktok, or both.",
+    };
+  }
+  const needYouTube = destination === "youtube" || destination === "both";
+  const needTikTok = destination === "tiktok" || destination === "both";
+
+  // ── 1. Authenticate (per destination) ──
+  const [youtubeAuth, tiktokAuth] = await Promise.all([
+    needYouTube ? getValidAccessToken(cookieHeader) : Promise.resolve(null),
+    needTikTok ? getValidTikTokToken(cookieHeader) : Promise.resolve(null),
+  ]);
+  const tiktokConfigured = !tiktokSetupPending();
+
+  // Early exits — skip the whole download/encode phase when nothing can be
+  // uploaded (single-destination) or no destination has any auth ("both").
+  if (destination === "youtube" && !youtubeAuth) {
     return {
       success: false,
       code: "NO_AUTH",
       error: "Not connected to YouTube. Connect your channel first.",
+    };
+  }
+  if (destination === "tiktok" && !tiktokConfigured) {
+    return {
+      success: false,
+      code: "TIKTOK_FAILED",
+      error:
+        "TikTok is not set up yet — the owner must add TIKTOK_CLIENT_KEY and TIKTOK_CLIENT_SECRET (TikTok Developer app approved for Content Posting).",
+    };
+  }
+  if (destination === "tiktok" && !tiktokAuth) {
+    return {
+      success: false,
+      code: "NO_AUTH",
+      error: "Not connected to TikTok. Connect your TikTok account first.",
+    };
+  }
+  if (destination === "both" && !youtubeAuth && !tiktokAuth) {
+    return {
+      success: false,
+      code: "NO_AUTH",
+      error:
+        "Connect at least one channel (YouTube or TikTok) to upload this clip.",
     };
   }
 
@@ -238,20 +341,71 @@ export async function uploadClipToYouTube(
       };
     }
 
-    // ── 6. Upload to YouTube ──
-    console.log(`[ClipFlow] Uploading to YouTube...`);
+    // ── 6. Upload to the selected destination(s) ──
+    // The SAME encoded shortPath is uploaded to each destination. Per-
+    // destination failures are collected; "both" uploads keep going even if
+    // one destination fails, and the outcome reports partial success.
+    let youtubeRes: DestinationUploadOutcome | undefined;
+    let tiktokRes: DestinationUploadOutcome | undefined;
+    let tiktokFreshCookie: string | undefined;
 
-    const uploadResult = await uploadToYouTubeAPI(
-      auth.accessToken,
-      shortPath,
-      input.title,
-      input.description
-    );
+    if (needYouTube) {
+      console.log(`[ClipFlow] Uploading to YouTube...`);
+      youtubeRes = youtubeAuth
+        ? toDestOutcome(
+            await uploadToYouTubeAPI(
+              youtubeAuth.accessToken,
+              shortPath,
+              input.title,
+              input.description
+            )
+          )
+        : {
+            ok: false,
+            code: "NO_AUTH",
+            error: "YouTube skipped: not connected.",
+          };
+    }
+
+    if (needTikTok) {
+      console.log(`[ClipFlow] Uploading to TikTok...`);
+      if (!tiktokConfigured) {
+        tiktokRes = {
+          ok: false,
+          code: "TIKTOK_FAILED",
+          error:
+            "TikTok is not set up yet — the owner must add TIKTOK_CLIENT_KEY and TIKTOK_CLIENT_SECRET (TikTok Developer app approved for Content Posting).",
+        };
+      } else if (!tiktokAuth) {
+        tiktokRes = {
+          ok: false,
+          code: "NO_AUTH",
+          error: "TikTok skipped: not connected.",
+        };
+      } else {
+        const res = await uploadToTikTokAPI(
+          tiktokAuth.accessToken,
+          shortPath,
+          input.title,
+          input.description
+        );
+        tiktokRes = res.ok
+          ? { ok: true, kind: "tiktok", publishId: res.publishId, videoUrl: res.videoUrl }
+          : { ok: false, code: "TIKTOK_FAILED", error: res.error };
+        // TikTok refresh tokens rotate on every refresh — persist the new one.
+        if (tiktokAuth.freshCookie) tiktokFreshCookie = tiktokAuth.freshCookie;
+      }
+    }
 
     // ── 7. Cleanup ──
     await Bun.$`rm -rf ${workDir}`.quiet().nothrow();
 
-    return uploadResult;
+    return composeUploadOutcome(
+      destination,
+      youtubeRes,
+      tiktokRes,
+      tiktokFreshCookie
+    );
   } catch (err) {
     // Clean up temp dir on any unexpected error
     await Bun.$`rm -rf ${workDir}`.quiet().nothrow();
@@ -262,6 +416,145 @@ export async function uploadClipToYouTube(
       error: err instanceof Error ? err.message : "Unexpected error during upload.",
     };
   }
+}
+
+/* ─────────────────────────────────────────────
+   Outcome Composition
+   ───────────────────────────────────────────── */
+
+/** Convert the YouTube upload result into the shared per-destination shape. */
+function toDestOutcome(r: UploadClipOutcome): DestinationUploadOutcome {
+  if (r.success) {
+    return { ok: true, kind: "youtube", videoId: r.videoId, videoUrl: r.videoUrl };
+  }
+  return { ok: false, code: r.code, error: r.error };
+}
+
+function isYtSuccess(
+  r: DestinationUploadOutcome | undefined
+): r is Extract<DestinationUploadResult, { kind: "youtube" }> {
+  return r?.ok === true && r.kind === "youtube";
+}
+
+function isTtSuccess(
+  r: DestinationUploadOutcome | undefined
+): r is Extract<DestinationUploadResult, { kind: "tiktok" }> {
+  return r?.ok === true && r.kind === "tiktok";
+}
+
+/**
+ * Compose the final UploadClipOutcome from the per-destination results.
+ * Top-level videoId/videoUrl stay backward compatible (YouTube values for
+ * youtube/both, TikTok publish_id for tiktok-only). "both" uploads that
+ * partially succeed return success:true with a `partialError` describing the
+ * failed destination; if BOTH destinations fail the overall result is an
+ * error listing both messages.
+ */
+function destErrorMsg(
+  r: DestinationUploadOutcome | undefined,
+  fallback: string
+): string {
+  return r && !r.ok ? r.error : fallback;
+}
+
+function composeUploadOutcome(
+  destination: UploadDestination,
+  youtube: DestinationUploadOutcome | undefined,
+  tiktok: DestinationUploadOutcome | undefined,
+  tiktokFreshCookie?: string
+): UploadClipOutcome {
+  if (destination === "youtube") {
+    if (isYtSuccess(youtube)) {
+      return {
+        success: true,
+        videoId: youtube.videoId,
+        videoUrl: youtube.videoUrl,
+        destination,
+        tiktokFreshCookie,
+      };
+    }
+    if (!youtube) {
+      return { success: false, code: "API_ERROR", error: "No YouTube upload was attempted." };
+    }
+    if (youtube.ok === false) {
+      return { success: false, code: youtube.code, error: youtube.error };
+    }
+    return {
+      success: false,
+      code: "API_ERROR",
+      error: "YouTube upload returned an unexpected result.",
+    };
+  }
+
+  if (destination === "tiktok") {
+    if (isTtSuccess(tiktok)) {
+      return {
+        success: true,
+        videoId: tiktok.publishId,
+        videoUrl: tiktok.videoUrl ?? "",
+        destination,
+        tiktok: { publishId: tiktok.publishId, videoUrl: tiktok.videoUrl },
+        tiktokFreshCookie,
+      };
+    }
+    if (!tiktok) {
+      return { success: false, code: "API_ERROR", error: "No TikTok upload was attempted." };
+    }
+    if (tiktok.ok === false) {
+      return { success: false, code: tiktok.code, error: tiktok.error };
+    }
+    return {
+      success: false,
+      code: "API_ERROR",
+      error: "TikTok upload returned an unexpected result.",
+    };
+  }
+
+  // destination === "both"
+  if (isYtSuccess(youtube) && isTtSuccess(tiktok)) {
+    return {
+      success: true,
+      videoId: youtube.videoId,
+      videoUrl: youtube.videoUrl,
+      destination: "both",
+      youtube: { videoId: youtube.videoId, videoUrl: youtube.videoUrl },
+      tiktok: { publishId: tiktok.publishId, videoUrl: tiktok.videoUrl },
+      tiktokFreshCookie,
+    };
+  }
+  if (isYtSuccess(youtube)) {
+    return {
+      success: true,
+      videoId: youtube.videoId,
+      videoUrl: youtube.videoUrl,
+      destination: "both",
+      youtube: { videoId: youtube.videoId, videoUrl: youtube.videoUrl },
+      partialError: `TikTok failed: ${destErrorMsg(tiktok, "unknown error")}`,
+      tiktokFreshCookie,
+    };
+  }
+  if (isTtSuccess(tiktok)) {
+    return {
+      success: true,
+      videoId: tiktok.publishId,
+      videoUrl: tiktok.videoUrl ?? "",
+      destination: "both",
+      tiktok: { publishId: tiktok.publishId, videoUrl: tiktok.videoUrl },
+      partialError: `YouTube failed: ${destErrorMsg(youtube, "unknown error")}`,
+      tiktokFreshCookie,
+    };
+  }
+
+  // Both destinations failed — surface both messages.
+  const parts = [
+    youtube ? `YouTube: ${destErrorMsg(youtube, "unknown error")}` : null,
+    tiktok ? `TikTok: ${destErrorMsg(tiktok, "unknown error")}` : null,
+  ].filter(Boolean);
+  return {
+    success: false,
+    code: "UPLOAD_FAILED",
+    error: parts.join(" — ") || "Both uploads failed.",
+  };
 }
 
 /* ─────────────────────────────────────────────
@@ -1271,100 +1564,6 @@ ${events.join("\n")}
   return events.length;
 }
 
-
-/* ─────────────────────────────────────────────
-   Metadata Sanitization
-   ───────────────────────────────────────────── */
-
-/**
- * Strip anything the YouTube Data API rejects in a snippet.title:
- * emojis, variation selectors, control/format chars, replacement
- * characters and unpaired surrogates. Keeps letters, digits and
- * punctuation (incl. non-ASCII letters like ä/é/ß).
- */
-function sanitizeTitle(title: string): string {
-  return stripLoneSurrogates(title)
-    .replace(/\p{Extended_Pictographic}/gu, "") // emoji pictographs (🤯🔥💡…)
-    .replace(/[\uFE00-\uFE0F\u{E0100}-\u{E01EF}]/gu, "") // variation selectors (emoji style)
-    .replace(/\p{Cc}/gu, "") // control characters
-    .replace(/\p{Cf}/gu, "") // format characters (ZWJ, bidi, soft hyphen…)
-    .replace(/[\uFFFD\uFFFE\uFFFF]/gu, "") // replacement char + noncharacters
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-/**
- * Strip everything the YouTube Data API rejects in snippet.description while
- * keeping the description readable. Google rejects invisible control/format
- * characters and noncharacters in snippet.description with 400
- * "invalidDescription" / "The string did not match the expected pattern".
- *
- * REMOVED (in order):
- *  - All C0/C1 control chars EXCEPT \n (0A), \r (0D), \t (09) — newlines,
- *    carriage returns and tabs are legitimate in descriptions and kept.
- *  - Line/paragraph separators U+2028 / U+2029 (control-like line breaks;
- *    \n already covers newlines).
- *  - ALL Unicode format characters (General Category \p{Cf}): zero-width
- *    space U+200B, ZWJ U+200D, bidi marks U+200E/U+200F/U+202A—U+202E, word
- *    joiner U+2060, soft hyphen U+00AD, BOM/ZWNBSP U+FEFF, Arabic letter
- *    mark U+061C, tag characters U+E0000—U+E007F, etc. These invisible chars
- *    are the most likely cause of the observed invalidDescription 400s
- *    (transcript-derived text is full of them). Trade-off: emoji ZWJ
- *    sequences (U+200D-joined, e.g. family emoji) render as side-by-side
- *    emojis — still valid, readable text; a lone ZWJ is invisible and useless
- *    anyway. NOTHING in Cf is allowlisted — prefer rejecting anything not
- *    clearly needed.
- *  - Replacement char U+FFFD and ALL Unicode noncharacters: U+FDD0—U+FDEF,
- *    U+FFFE/U+FFFF, and U+xFFFE/U+xFFFF for every plane 1—16
- *    (U+1FFFE—U+10FFFF).
- *  - Lone surrogates (via stripLoneSurrogates) — an unpaired surrogate makes
- *    JSON.stringify emit \uD83D-style escapes, which Google also rejects.
- *
- * KEPT: \n \r \t, normal whitespace, letters, digits, punctuation, emojis
- * (minus their ZWJ joiners per the rule above), variation selectors
- * (U+FE00—U+FE0F, U+E0100—U+E01EF — Mn marks that make emoji render as
- * emoji; harmless to the validator). Nothing is collapsed: internal
- * whitespace and line structure survive as-is, only the edges are trimmed.
- */
-export function sanitizeDescription(desc: string): string {
-  return stripLoneSurrogates(desc)
-    // All C0/C1 control chars EXCEPT \n (0A), \r (0D), \t (09)
-    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/g, "")
-    // Line/paragraph separators (U+2028/U+2029) — control-like line breaks
-    // that some validators reject; \n already covers newlines.
-    .replace(/[\u2028\u2029]/g, "")
-    // ALL format characters (Category Cf): ZWSP U+200B, ZWJ U+200D, bidi
-    // marks U+200E/U+200F/U+202A-U+202E, word joiner U+2060, soft hyphen
-    // U+00AD, BOM U+FEFF, tag chars U+E0000-U+E007F, etc. Invisible chars
-    // are the prime suspect for Google's invalidDescription 400s. Requires
-    // the `u` flag; supported in Bun and Node.
-    .replace(/\p{Cf}/gu, "")
-    // Replacement char + ALL Unicode noncharacters (U+FDD0-U+FDEF, plus
-    // U+FFFE/U+FFFF and each plane's last two code points
-    // U+1FFFE/U+1FFFF — U+10FFFE/U+10FFFF).
-    .replace(
-      /[\uFFFD\uFDD0-\uFDEF\uFFFE\uFFFF\u{1FFFE}\u{1FFFF}\u{2FFFE}\u{2FFFF}\u{3FFFE}\u{3FFFF}\u{4FFFE}\u{4FFFF}\u{5FFFE}\u{5FFFF}\u{6FFFE}\u{6FFFF}\u{7FFFE}\u{7FFFF}\u{8FFFE}\u{8FFFF}\u{9FFFE}\u{9FFFF}\u{AFFFE}\u{AFFFF}\u{BFFFE}\u{BFFFF}\u{CFFFE}\u{CFFFF}\u{DFFFE}\u{DFFFF}\u{EFFFE}\u{EFFFF}\u{FFFFE}\u{FFFFF}\u{10FFFE}\u{10FFFF}]/gu,
-      ""
-    )
-    // Trim edges only (never collapses internal whitespace/newlines) so a
-    // removed control char at the start/end doesn't leave a stray space.
-    .trim();
-}
-
-/** Remove unpaired surrogate halves that break JSON/API string validation. */
-function stripLoneSurrogates(s: string): string {
-  // eslint-disable-next-line no-misleading-character-class
-  return s.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/gu, "").replace(
-    /(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/gu,
-    ""
-  );
-}
-
-/** Truncate by Unicode code points so we never split a surrogate pair. */
-export function truncateToCodePoints(s: string, max: number): string {
-  if (s.length <= max) return s;
-  return Array.from(s).slice(0, max).join("");
-}
 
 /** Keep only [a-zA-Z0-9_-], lowercase, max 30 chars (YouTube tag rules). */
 function sanitizeTag(raw: string): string {
