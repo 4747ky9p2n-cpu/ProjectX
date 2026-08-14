@@ -2,6 +2,7 @@ import { createFileRoute } from "@tanstack/react-router";
 import { createServerFn } from "@tanstack/react-start";
 import { useState, useEffect, useCallback } from "react";
 import type { YouTubeChannel } from "~/lib/youtube-auth";
+import type { TikTokUser } from "~/lib/tiktok-auth";
 import type { ChannelInfo, ChannelVideoItem } from "~/lib/channel-handler";
 import { fetchTranscript } from "~/lib/transcript";
 import type { TranscriptSegment } from "~/lib/transcript";
@@ -24,14 +25,23 @@ interface AnalysisResult {
   clips: ClipSuggestion[];
 }
 
-type UploadStatus = "idle" | "uploading" | "success" | "error";
+type UploadStatus = "idle" | "uploading" | "success" | "error" | "partial";
 
 interface ClipUploadState {
   status: UploadStatus;
   videoUrl?: string;
   videoId?: string;
   errorMessage?: string;
+  /** Where this upload was sent (echoed from the server). */
+  destination?: "youtube" | "tiktok" | "both";
+  /** Per-destination results (present for "both" uploads). */
+  youtube?: { videoId: string; videoUrl: string };
+  tiktok?: { publishId?: string; videoUrl?: string };
+  /** "both" upload where one destination failed — message for the failed one. */
+  partialError?: string;
 }
+
+type Destination = "youtube" | "tiktok" | "both";
 
 /* ─────────────────────────────────────────────
    Server Function: Video Analysis
@@ -220,6 +230,14 @@ type ConnectionInfo = {
   loading: boolean;
 };
 
+type TikTokConnectionInfo = {
+  connected: boolean;
+  /** True when TIKTOK_CLIENT_KEY/SECRET are missing — show a setup hint. */
+  setupPending: boolean;
+  user?: TikTokUser;
+  loading: boolean;
+};
+
 type AppState =
   | { kind: "idle" }
   | { kind: "loading" }
@@ -247,6 +265,12 @@ function AppPage() {
     connected: false,
     loading: true,
   });
+  const [tiktokConnection, setTiktokConnection] =
+    useState<TikTokConnectionInfo>({
+      connected: false,
+      setupPending: false,
+      loading: true,
+    });
 
   // Check connection status on mount
   useEffect(() => {
@@ -259,7 +283,26 @@ function AppPage() {
         setConnection({ connected: false, loading: false });
       }
     }
+    async function checkTikTokConnection() {
+      try {
+        const resp = await fetch("/api/auth/tiktok/channel");
+        const result = await resp.json() as {
+          connected: boolean;
+          setupPending?: boolean;
+          user?: TikTokUser;
+        };
+        setTiktokConnection({
+          connected: result.connected,
+          setupPending: result.setupPending === true,
+          user: result.user,
+          loading: false,
+        });
+      } catch {
+        setTiktokConnection({ connected: false, setupPending: false, loading: false });
+      }
+    }
     checkConnection();
+    checkTikTokConnection();
   }, []);
 
   // Check if we just connected via OAuth callback
@@ -278,6 +321,24 @@ function AppPage() {
       }
       if (params.get("disconnected") === "true") {
         setConnection({ connected: false, loading: false });
+        window.history.replaceState({}, "", "/app");
+      }
+      if (params.get("tiktok") === "connected") {
+        // Re-check TikTok connection to get the user profile
+        fetch("/api/auth/tiktok/channel")
+          .then((r) => r.json())
+          .then((result: { connected: boolean; setupPending?: boolean; user?: TikTokUser }) => {
+            setTiktokConnection({
+              connected: result.connected,
+              setupPending: result.setupPending === true,
+              user: result.user,
+              loading: false,
+            });
+          });
+        window.history.replaceState({}, "", "/app");
+      }
+      if (params.get("tiktok") === "disconnected") {
+        setTiktokConnection({ connected: false, setupPending: false, loading: false });
         window.history.replaceState({}, "", "/app");
       }
     }
@@ -303,6 +364,10 @@ function AppPage() {
 
   function handleDisconnect() {
     window.location.href = "/api/auth/youtube/disconnect";
+  }
+
+  function handleTikTokDisconnect() {
+    window.location.href = "/api/auth/tiktok/disconnect";
   }
 
   /** Fetch a channel's recent videos from the new channel endpoint. */
@@ -424,6 +489,52 @@ function AppPage() {
                 >
                   <YouTubeIcon />
                   Connect YouTube
+                </a>
+              )
+            )}
+            {/* TikTok Connect Button */}
+            {!tiktokConnection.loading && (
+              tiktokConnection.setupPending ? (
+                <span
+                  className="hidden items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.04] px-3 py-2 text-xs font-medium text-gray-500 sm:inline-flex"
+                  title="TIKTOK_CLIENT_KEY / TIKTOK_CLIENT_SECRET fehlen — der Owner muss die TikTok Developer App für Content Posting einrichten"
+                >
+                  TikTok: Setup ausstehend
+                  <span className="text-gray-600">(TIKTOK_CLIENT_KEY fehlt)</span>
+                </span>
+              ) : tiktokConnection.connected ? (
+                <div className="flex items-center gap-3">
+                  {tiktokConnection.user && (
+                    <div className="hidden items-center gap-2 sm:flex">
+                      {tiktokConnection.user.avatarUrl && (
+                        <img
+                          src={tiktokConnection.user.avatarUrl}
+                          alt=""
+                          className="h-7 w-7 rounded-full"
+                        />
+                      )}
+                      <span className="text-sm text-gray-300 max-w-[120px] truncate">
+                        {tiktokConnection.user.displayName}
+                      </span>
+                    </div>
+                  )}
+                  <span className="hidden sm:inline-flex items-center gap-1 rounded-full bg-green-500/10 px-2.5 py-0.5 text-xs font-medium text-green-400">
+                    <CheckIcon /> Connected
+                  </span>
+                  <button
+                    onClick={handleTikTokDisconnect}
+                    className="text-xs text-gray-500 hover:text-red-400 transition-colors"
+                  >
+                    Disconnect
+                  </button>
+                </div>
+              ) : (
+                <a
+                  href="/api/auth/tiktok"
+                  className="inline-flex items-center gap-2 rounded-lg border border-white/20 bg-[#161616] px-4 py-2 text-sm font-semibold text-white transition-all hover:border-[#25F4EE] hover:bg-[#1f1f1f] active:scale-95"
+                >
+                  <TikTokIcon />
+                  Connect TikTok
                 </a>
               )
             )}
@@ -660,6 +771,8 @@ function AppPage() {
           <ResultsSection
             result={state.result}
             isConnected={connection.connected}
+            tiktokConnected={tiktokConnection.connected}
+            tiktokSetupPending={tiktokConnection.setupPending}
             onReset={() => {
               setState({ kind: "idle" });
               setUrl("");
@@ -772,10 +885,14 @@ function ChannelSection({
 function ResultsSection({
   result,
   isConnected,
+  tiktokConnected,
+  tiktokSetupPending,
   onReset,
 }: {
   result: AnalysisResult;
   isConnected: boolean;
+  tiktokConnected: boolean;
+  tiktokSetupPending: boolean;
   onReset: () => void;
 }) {
   // Local copy of the clips so per-clip re-lengthing can re-snap endTime
@@ -785,6 +902,28 @@ function ResultsSection({
   const [uploadStates, setUploadStates] = useState<ClipUploadState[]>(
     () => result.clips.map(() => ({ status: "idle" }))
   );
+  // Global upload destination (YouTube / TikTok / Both). Defaults to the
+  // first channel that is connected; clamped when a channel disconnects.
+  const [destination, setDestination] = useState<Destination>(
+    () => (isConnected ? "youtube" : tiktokConnected ? "tiktok" : "youtube")
+  );
+
+  // If the selected destination becomes unavailable (channel disconnected
+  // while the results stay on screen), fall back to an available one.
+  useEffect(() => {
+    setDestination((prev) => {
+      if (prev === "youtube" && !isConnected) {
+        return tiktokConnected ? "tiktok" : "youtube";
+      }
+      if (prev === "tiktok" && !tiktokConnected) {
+        return isConnected ? "youtube" : "tiktok";
+      }
+      if (prev === "both" && !(isConnected && tiktokConnected)) {
+        return isConnected ? "youtube" : tiktokConnected ? "tiktok" : "youtube";
+      }
+      return prev;
+    });
+  }, [isConnected, tiktokConnected]);
 
   /** Re-snap a single clip to a new length: endTime = startTime + N,
    *  clamped to the video length. Upload uses startTime/endTime, so the
@@ -825,6 +964,8 @@ function ResultsSection({
             endTime: clip.endTime,
             title: clip.title,
             description: clip.description,
+            // Where to publish: "youtube" | "tiktok" | "both"
+            destination,
             // Caption segments for this clip time window (optional;
             // the server burns them in when present).
             segments: clip.captions ?? [],
@@ -835,16 +976,27 @@ function ResultsSection({
           success: boolean;
           videoId?: string;
           videoUrl?: string;
+          destination?: Destination;
+          youtube?: { videoId: string; videoUrl: string };
+          tiktok?: { publishId?: string; videoUrl?: string };
+          partialError?: string;
           error?: string;
         };
 
-        if (data.success && data.videoUrl) {
+        if (data.success) {
+          // success — including partial success for "both" uploads where one
+          // destination failed (data.partialError) and background uploads
+          // where the timeout/network error hid a landing publish.
           setUploadStates((prev) => {
             const next = [...prev];
             next[clipIndex] = {
-              status: "success",
+              status: data.partialError ? "partial" : "success",
               videoUrl: data.videoUrl,
               videoId: data.videoId,
+              destination: data.destination,
+              youtube: data.youtube,
+              tiktok: data.tiktok,
+              partialError: data.partialError,
             };
             return next;
           });
@@ -876,12 +1028,12 @@ function ResultsSection({
         // this as a successful background upload instead of a misleading error.
         setUploadStates((prev) => {
           const next = [...prev];
-          next[clipIndex] = { status: "success" };
+          next[clipIndex] = { status: "success", destination };
           return next;
         });
       }
     },
-    [clips, result.videoId]
+    [clips, result.videoId, destination]
   );
 
   const handleRetry = useCallback(
@@ -933,6 +1085,78 @@ function ResultsSection({
         </div>
       </div>
 
+      {/* Destination selector — where uploaded clips should go */}
+      <div className="mb-6 flex flex-wrap items-center gap-x-4 gap-y-2">
+        <div className="flex items-center gap-3">
+          <span className="text-sm text-gray-400">Upload to:</span>
+          <div className="inline-flex rounded-xl border border-white/10 bg-white/[0.04] p-1">
+            <button
+              type="button"
+              onClick={() => setDestination("youtube")}
+              disabled={!isConnected}
+              title={isConnected ? undefined : "Connect YouTube first"}
+              className={`rounded-lg px-3 py-1.5 text-sm font-medium transition-all disabled:cursor-not-allowed disabled:opacity-40 ${
+                destination === "youtube"
+                  ? "bg-[#FF0000]/20 text-red-400"
+                  : "text-gray-400 hover:text-white"
+              }`}
+            >
+              YouTube
+            </button>
+            <button
+              type="button"
+              onClick={() => setDestination("tiktok")}
+              disabled={!tiktokConnected}
+              title={tiktokConnected ? undefined : "Connect TikTok first"}
+              className={`rounded-lg px-3 py-1.5 text-sm font-medium transition-all disabled:cursor-not-allowed disabled:opacity-40 ${
+                destination === "tiktok"
+                  ? "bg-[#25F4EE]/10 text-[#25F4EE]"
+                  : "text-gray-400 hover:text-white"
+              }`}
+            >
+              TikTok
+            </button>
+            <button
+              type="button"
+              onClick={() => setDestination("both")}
+              disabled={!(isConnected && tiktokConnected)}
+              title={
+                isConnected && tiktokConnected
+                  ? undefined
+                  : "Connect YouTube and TikTok to upload to both"
+              }
+              className={`rounded-lg px-3 py-1.5 text-sm font-medium transition-all disabled:cursor-not-allowed disabled:opacity-40 ${
+                destination === "both"
+                  ? "bg-white/[0.12] text-white"
+                  : "text-gray-400 hover:text-white"
+              }`}
+            >
+              Both
+            </button>
+          </div>
+        </div>
+        {tiktokSetupPending ? (
+          <span
+            className="text-xs text-gray-600"
+            title="TIKTOK_CLIENT_KEY / TIKTOK_CLIENT_SECRET fehlen — der Owner muss die TikTok Developer App für Content Posting einrichten"
+          >
+            TikTok: Setup ausstehend (TIKTOK_CLIENT_KEY fehlt)
+          </span>
+        ) : (
+          !tiktokConnected && (
+            <span className="text-xs text-gray-600">
+              <a
+                href="/api/auth/tiktok"
+                className="text-[#25F4EE] hover:underline transition-colors"
+              >
+                Connect TikTok
+              </a>{" "}
+              to upload there too.
+            </span>
+          )
+        )}
+      </div>
+
       {/* Clip cards */}
       <h3 className="mb-6 text-lg font-semibold text-gray-300">
         Suggested Shorts Clips
@@ -944,6 +1168,9 @@ function ResultsSection({
             clip={clip}
             index={i + 1}
             isConnected={isConnected}
+            tiktokConnected={tiktokConnected}
+            tiktokSetupPending={tiktokSetupPending}
+            destination={destination}
             uploadState={uploadStates[i] || { status: "idle" }}
             onUpload={() => handleUpload(i)}
             onRetry={() => handleRetry(i)}
@@ -963,6 +1190,9 @@ function ClipCard({
   clip,
   index,
   isConnected,
+  tiktokConnected,
+  tiktokSetupPending,
+  destination,
   uploadState,
   onUpload,
   onRetry,
@@ -971,6 +1201,9 @@ function ClipCard({
   clip: ClipSuggestion;
   index: number;
   isConnected: boolean;
+  tiktokConnected: boolean;
+  tiktokSetupPending: boolean;
+  destination: Destination;
   uploadState: ClipUploadState;
   onUpload: () => void;
   onRetry: () => void;
@@ -1073,22 +1306,36 @@ function ClipCard({
             </div>
           )}
 
-          {/* Upload to YouTube button */}
-          {isConnected ? (
+          {/* Upload button — available when at least one channel is connected */}
+          {isConnected || tiktokConnected ? (
             <UploadButton
               uploadState={uploadState}
+              destination={destination}
               onUpload={onUpload}
               onRetry={onRetry}
             />
           ) : (
             <p className="text-xs text-gray-600">
-              <a
-                href="/api/auth/youtube"
-                className="text-red-400 hover:text-red-300 transition-colors"
-              >
-                Connect YouTube
-              </a>{" "}
-              to upload clips directly.
+              {tiktokSetupPending ? (
+                "TikTok: Setup ausstehend (TIKTOK_CLIENT_KEY fehlt)"
+              ) : (
+                <>
+                  <a
+                    href="/api/auth/youtube"
+                    className="text-red-400 hover:text-red-300 transition-colors"
+                  >
+                    Connect YouTube
+                  </a>{" "}
+                  or{" "}
+                  <a
+                    href="/api/auth/tiktok"
+                    className="text-[#25F4EE] hover:underline transition-colors"
+                  >
+                    Connect TikTok
+                  </a>{" "}
+                  to upload clips directly.
+                </>
+              )}
             </p>
           )}
         </div>
@@ -1103,26 +1350,41 @@ function ClipCard({
 
 function UploadButton({
   uploadState,
+  destination,
   onUpload,
   onRetry,
 }: {
   uploadState: ClipUploadState;
+  destination: Destination;
   onUpload: () => void;
   onRetry: () => void;
 }) {
-  const { status, videoUrl, errorMessage } = uploadState;
+  const { status, videoUrl, errorMessage, youtube, tiktok, partialError } =
+    uploadState;
+
+  const destLabel =
+    uploadState.destination || destination || "youtube";
+  const successLabel =
+    destLabel === "both"
+      ? "Uploaded to both!"
+      : destLabel === "tiktok"
+        ? "Uploaded to TikTok!"
+        : "Uploaded to YouTube!";
 
   if (status === "success") {
+    const hasYtLink =
+      youtube?.videoUrl || (destLabel !== "tiktok" ? videoUrl : undefined);
+    const hasTtLink = tiktok?.videoUrl;
     return (
       <div className="space-y-2">
         <div className="flex flex-wrap items-center gap-3">
           <span className="inline-flex items-center gap-1.5 rounded-lg bg-green-500/10 px-3 py-2 text-sm font-medium text-green-400">
             <CheckIconSolid />
-            Uploaded!
+            {successLabel}
           </span>
-          {videoUrl && (
+          {hasYtLink && (
             <a
-              href={videoUrl}
+              href={hasYtLink}
               target="_blank"
               rel="noopener noreferrer"
               className="inline-flex items-center gap-1.5 rounded-lg bg-white/[0.06] px-3 py-2 text-sm font-medium text-white transition-all hover:bg-white/[0.12]"
@@ -1131,11 +1393,61 @@ function UploadButton({
               View on YouTube
             </a>
           )}
+          {hasTtLink && (
+            <a
+              href={hasTtLink}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-1.5 rounded-lg bg-white/[0.06] px-3 py-2 text-sm font-medium text-white transition-all hover:bg-white/[0.12]"
+            >
+              <LinkIcon />
+              View on TikTok
+            </a>
+          )}
         </div>
-        {!videoUrl && (
+        {!hasYtLink && !hasTtLink && (
           <p className="text-xs text-white/50 max-w-md">
-            Running in the background — check your channel
+            Running in the background — check your {destLabel === "tiktok" ? "TikTok" : "channel"}
           </p>
+        )}
+      </div>
+    );
+  }
+
+  if (status === "partial") {
+    // "both" upload where one destination succeeded and the other failed.
+    return (
+      <div className="space-y-2">
+        <div className="flex flex-wrap items-center gap-3">
+          <span className="inline-flex items-center gap-1.5 rounded-lg bg-green-500/10 px-3 py-2 text-sm font-medium text-green-400">
+            <CheckIconSolid />
+            {youtube && !tiktok
+              ? "Uploaded to YouTube ✓"
+              : tiktok && !youtube
+                ? "Uploaded to TikTok ✓"
+                : "Partially uploaded"}
+          </span>
+          {youtube?.videoUrl && (
+            <a
+              href={youtube.videoUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-1.5 rounded-lg bg-white/[0.06] px-3 py-2 text-sm font-medium text-white transition-all hover:bg-white/[0.12]"
+            >
+              <LinkIcon />
+              View on YouTube
+            </a>
+          )}
+          <button
+            onClick={onRetry}
+            className="inline-flex items-center gap-2 rounded-lg border border-red-500/50 bg-red-500/10 px-3 py-2 text-sm font-medium text-red-400 transition-all hover:bg-red-500/20 hover:text-red-300 active:scale-95"
+          >
+            <RetryIcon />
+            Retry failed
+          </button>
+        </div>
+        {partialError && (
+          <p className="text-xs text-red-400/70 max-w-md">{partialError}</p>
         )}
       </div>
     );
@@ -1172,14 +1484,20 @@ function UploadButton({
     );
   }
 
-  // idle
+  // idle — label reflects the selected destination
+  const idleLabel =
+    destLabel === "both"
+      ? "Upload to YouTube + TikTok"
+      : destLabel === "tiktok"
+        ? "Upload to TikTok"
+        : "Upload to YouTube";
   return (
     <button
       onClick={onUpload}
       className="inline-flex items-center gap-2 rounded-lg border border-white/10 bg-white/[0.05] px-4 py-2 text-sm font-medium text-white transition-all hover:border-red-500/30 hover:bg-red-500/10 hover:text-red-400 active:scale-95"
     >
-      <UploadToYouTubeIcon />
-      Upload to YouTube
+      {destLabel === "tiktok" ? <TikTokIcon /> : <UploadToYouTubeIcon />}
+      {idleLabel}
     </button>
   );
 }
@@ -1340,6 +1658,14 @@ function UploadToYouTubeIcon() {
   return (
     <svg className="h-4 w-4" viewBox="0 0 24 24" fill="currentColor">
       <path d="M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z" />
+    </svg>
+  );
+}
+
+function TikTokIcon() {
+  return (
+    <svg className="h-4 w-4" viewBox="0 0 24 24" fill="currentColor">
+      <path d="M19.59 6.69a4.83 4.83 0 0 1-3.77-4.25V2h-3.45v13.67a2.89 2.89 0 0 1-5.2 1.74 2.89 2.89 0 0 1 2.31-4.64 2.93 2.93 0 0 1 .88.13V9.4a6.84 6.84 0 0 0-1-.05A6.33 6.33 0 0 0 5 20.1a6.34 6.34 0 0 0 10.86-4.43v-7a8.16 8.16 0 0 0 4.77 1.52v-3.4a4.85 4.85 0 0 1-1-.1z" />
     </svg>
   );
 }

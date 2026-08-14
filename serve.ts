@@ -17,6 +17,12 @@ import {
 } from "./src/lib/oauth-handlers";
 import { handleUploadClip } from "./src/lib/upload-handler";
 import { handleChannelVideos } from "./src/lib/channel-handler";
+import {
+  handleTikTokAuthInitiate,
+  handleTikTokAuthCallback,
+  handleTikTokDisconnect,
+  handleTikTokChannelInfo,
+} from "./src/lib/tiktok-handlers";
 
 // Pinned, NOT read from the environment. The published preview URL
 // (<label>.<PUBLIC_SITE_DOMAIN>) is reverse-proxied to 0.0.0.0:3000 inside the
@@ -62,6 +68,18 @@ for (let attempt = 1; ; attempt++) {
         }
         if (pathname === "/api/auth/youtube/channel" && req.method === "GET") {
           return handleChannelInfo(req);
+        }
+        if (pathname === "/api/auth/tiktok" && req.method === "GET") {
+          return handleTikTokAuthInitiate();
+        }
+        if (pathname === "/api/auth/tiktok/callback" && req.method === "GET") {
+          return handleTikTokAuthCallback(req);
+        }
+        if (pathname === "/api/auth/tiktok/disconnect" && req.method === "GET") {
+          return handleTikTokDisconnect();
+        }
+        if (pathname === "/api/auth/tiktok/channel" && req.method === "GET") {
+          return handleTikTokChannelInfo(req);
         }
         if (pathname === "/api/upload/clip" && req.method === "POST") {
           return handleUploadClip(req);
