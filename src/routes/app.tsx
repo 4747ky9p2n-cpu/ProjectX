@@ -25,7 +25,13 @@ interface AnalysisResult {
   clips: ClipSuggestion[];
 }
 
-type UploadStatus = "idle" | "uploading" | "success" | "error" | "partial";
+type UploadStatus =
+  | "idle"
+  | "uploading"
+  | "background"
+  | "success"
+  | "error"
+  | "partial";
 
 interface ClipUploadState {
   status: UploadStatus;
@@ -974,6 +980,8 @@ function ResultsSection({
 
         const data = (await resp.json()) as {
           success: boolean;
+          background?: boolean;
+          accepted?: boolean;
           videoId?: string;
           videoUrl?: string;
           destination?: Destination;
@@ -983,10 +991,22 @@ function ResultsSection({
           error?: string;
         };
 
-        if (data.success) {
-          // success — including partial success for "both" uploads where one
-          // destination failed (data.partialError) and background uploads
-          // where the timeout/network error hid a landing publish.
+        // The server CONFIRMED acceptance and is processing the upload in the
+        // background. This is honest only because it is a real server
+        // response (202): success is never inferred from a fetch failure.
+        if (resp.status === 202 && data.background) {
+          setUploadStates((prev) => {
+            const next = [...prev];
+            next[clipIndex] = {
+              status: "background",
+              destination: data.destination ?? destination,
+            };
+            return next;
+          });
+        } else if (data.success) {
+          // Confirmed success (non-background path, kept for compatibility)
+          // — including partial success for "both" uploads where one
+          // destination failed (data.partialError).
           setUploadStates((prev) => {
             const next = [...prev];
             next[clipIndex] = {
@@ -1000,19 +1020,8 @@ function ResultsSection({
             };
             return next;
           });
-        } else if (
-          data.error &&
-          /did not match the expected pattern/i.test(data.error)
-        ) {
-          // Legacy Google rejection that is already fixed server-side (title/tag
-          // sanitization). If it still surfaces here it is a stale response and
-          // the upload actually lands, so show success rather than an error.
-          setUploadStates((prev) => {
-            const next = [...prev];
-            next[clipIndex] = { status: "success" };
-            return next;
-          });
         } else {
+          // The server answered with an error (e.g. NO_AUTH 401, bad body).
           setUploadStates((prev) => {
             const next = [...prev];
             next[clipIndex] = {
@@ -1023,12 +1032,16 @@ function ResultsSection({
           });
         }
       } catch {
-        // Network failure/timeout during upload: the server keeps processing the
-        // upload in the background and publishes the Short regardless, so show
-        // this as a successful background upload instead of a misleading error.
+        // No server response at all (network failure, connection refused,
+        // wrong host, request never sent). The upload was NOT accepted by the
+        // server, so it must never be shown as success.
         setUploadStates((prev) => {
           const next = [...prev];
-          next[clipIndex] = { status: "success", destination };
+          next[clipIndex] = {
+            status: "error",
+            errorMessage:
+              "Upload konnte nicht gesendet werden – keine Verbindung zum Server. Prüfe, dass du die ClipFlow-App über die richtige URL öffnest, und versuch es erneut.",
+          };
           return next;
         });
       }
@@ -1449,6 +1462,22 @@ function UploadButton({
         {partialError && (
           <p className="text-xs text-red-400/70 max-w-md">{partialError}</p>
         )}
+      </div>
+    );
+  }
+
+  if (status === "background") {
+    // Server accepted the upload (202) and is processing it in the background.
+    // Deliberately distinct from "success": the Short is NOT up yet.
+    return (
+      <div className="space-y-2">
+        <span className="inline-flex items-center gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm font-medium text-amber-300">
+          <Spinner />
+          Upload angenommen – läuft im Hintergrund
+        </span>
+        <p className="text-xs text-white/50 max-w-md">
+          Das Short erscheint gleich in deinem Kanal.
+        </p>
       </div>
     );
   }
