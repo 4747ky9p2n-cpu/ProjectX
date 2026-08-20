@@ -48,16 +48,26 @@ mock.module("../src/lib/youtube-auth", () => ({
 }));
 
 /** Record yt-dlp invocations and return a controllable result. */
-let ytdlpCalls: { header: string | null }[] = [];
+let ytdlpCalls: { header: string | null; separate: boolean }[] = [];
 let ytdlpResult: { exitCode: number; stderr: string };
 
 // The template args arrive as the 2nd..nth params of the tag function. We
-// re-wrap Bun.$ to capture the interpolated args (to read the bearer token)
-// and return a `.nothrow()` chain like the real Bun.$ shell object.
-function captureImpl(_strings: any, ...values: string[]) {
-  const joined = values.join(" ");
-  const m = joined.match(/--add-header "Authorization: Bearer ([^"]+)"/);
-  ytdlpCalls.push({ header: m ? m[1] : null });
+// re-wrap Bun.$ to capture the interpolated args (to read the bearer token
+// and assert --add-header lands as its OWN argv element) and return a
+// `.nothrow()` chain like the real Bun.$ shell object.
+function captureImpl(_strings: any, ...values: any[]) {
+  // Bun.$ passes a nested array (headerArgs) as a single interpolated value,
+  // then flattens it into real argv elements. Flatten to mirror real argv.
+  const argv: string[] = values.flat(1).map(String);
+  const idx = argv.indexOf("--add-header");
+  let header: string | null = null;
+  let separate = false;
+  if (idx >= 0) {
+    separate = true; // --add-header arrived as its own argv element
+    const value = argv[idx + 1] ?? "";
+    header = value.replace(/^Authorization: Bearer /, "") || null;
+  }
+  ytdlpCalls.push({ header, separate });
   return {
     nothrow: () => ({ exitCode: ytdlpResult.exitCode, stderr: ytdlpResult.stderr }),
   };
@@ -102,6 +112,9 @@ describe("downloadViaYtDlpFallback error mapping", () => {
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error).toMatch(/age-restricted/i);
     expect(ytdlpCalls[0]!.header).toBe("REAL_TOKEN");
+    // --add-header must be passed as its own argv element, NOT inlined into a
+    // single quoted string (that made yt-dlp say "no such option").
+    expect(ytdlpCalls[0]!.separate).toBe(true);
   });
 
   test("authenticated: 'members-only' -> members/private message", async () => {
