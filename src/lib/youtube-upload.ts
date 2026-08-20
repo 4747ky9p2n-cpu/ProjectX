@@ -1112,15 +1112,20 @@ export async function downloadViaYtDlpFallback(
   authBearer: string | null = null
 ): Promise<DownloadOutcome> {
   try {
-    const header = authBearer
-      ? `--add-header "Authorization: Bearer ${authBearer}"`
-      : "";
+    // Pass --add-header and its full value ("Authorization: Bearer <token>") as
+    // SEPARATE argv elements (Bun.$ spreads arrays in the template literal).
+    // Inlining them into one quoted string made yt-dlp treat the whole thing as
+    // a single option ("no such option: --add-header \"Authorization:...\"") and
+    // would split the header value on spaces.
+    const headerArgs = authBearer
+      ? ["--add-header", `Authorization: Bearer ${authBearer}`]
+      : [];
     const dlResult = await Bun.$`yt-dlp \
       -f "best[height<=1080]" \
       -o ${rawClipPath} \
       --no-playlist \
       --no-warnings \
-      ${header} \
+      ${headerArgs} \
       ${videoUrl}`
       .nothrow();
     if (dlResult.exitCode !== 0) {
