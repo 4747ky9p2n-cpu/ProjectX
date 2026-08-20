@@ -150,6 +150,7 @@ export async function getToolStatus(): Promise<{
   const tools = await checkTools();
   const missing: string[] = [];
   if (!tools.ffmpeg) missing.push("ffmpeg (apt install ffmpeg)");
+  if (!tools.ytdlp) missing.push("yt-dlp (pip install yt-dlp)");
 
   return {
     ...tools,
@@ -231,13 +232,18 @@ export async function uploadClip(
     };
   }
 
-  // ── 2. Check tools (only ffmpeg is required; yt-dlp is an optional fallback) ──
+  // ── 2. Check tools (ffmpeg required for encoding; yt-dlp required for the
+  //        authenticated fallback that bypasses YouTube's anonymous bot-check,
+  //        which the free Piped network can no longer do for the owner's videos) ──
   const tools = await checkTools();
-  if (!tools.ffmpeg) {
+  const missingTools: string[] = [];
+  if (!tools.ffmpeg) missingTools.push("ffmpeg (Run: apt install ffmpeg)");
+  if (!tools.ytdlp) missingTools.push("yt-dlp (Run: pip install yt-dlp)");
+  if (missingTools.length > 0) {
     return {
       success: false,
       code: "MISSING_TOOLS",
-      error: "Video processing tool ffmpeg is not installed. Run: apt install ffmpeg",
+      error: `Missing required tool(s): ${missingTools.join(", ")}`,
     };
   }
 
@@ -251,7 +257,11 @@ export async function uploadClip(
 
     // ── 4. Download source video (Supadata API primary, yt-dlp fallback) ──
     console.log(`[ClipFlow] Downloading source video: ${input.videoUrl}`);
-    const download = await downloadSourceVideo(input.videoUrl, rawClipPath);
+    const download = await downloadSourceVideo(
+      input.videoUrl,
+      rawClipPath,
+      cookieHeader
+    );
     if (!download.ok) {
       // Clean up
       await Bun.$`rm -rf ${workDir}`.quiet().nothrow();
@@ -735,13 +745,31 @@ type DownloadOutcome = DownloadSuccess | DownloadFailure;
  */
 export async function downloadSourceVideo(
   videoUrl: string,
-  rawClipPath: string
+  rawClipPath: string,
+  cookieHeader: string | null = null
 ): Promise<DownloadOutcome> {
   // ── Primary: Piped public API (free, no key) ──
   const piped = await downloadViaPiped(videoUrl, rawClipPath);
   if (piped.ok) return piped;
+  // Fallback 1 (new): Authenticated yt-dlp using the owner's YouTube OAuth.
+  // The free Piped network is near-dead and its lone live instance anonymously
+  // bot-blocks the owner's source videos (HTTP 500 SignInConfirmNotBotException).
+  // YouTube treats authenticated requests differently, so retry directly with
+  // the owner's OAuth access token (read from the youtube_auth request cookie),
+  // which bypasses the bot-check. Only attempted when a valid token exists.
+  const authenticated = await tryYtDlpAuthenticated(
+    videoUrl,
+    rawClipPath,
+    cookieHeader
+  );
+  if (authenticated.ok) return authenticated;
+  if (authenticated.tried) {
+    console.error(
+      `[ClipFlow] Authenticated yt-dlp download failed: ${authenticated.error}`
+    );
+  }
 
-  // ── Fallback 1: Supadata download API ──
+  // ── Fallback 2: Supadata download API ──
   const res = await fetchSupadataDownload(videoUrl);
   if (res.ok) {
     try {
@@ -1041,26 +1069,92 @@ async function attemptPipedStreamsFetch(
   }
 }
 
-/** yt-dlp fallback: download the full video (best <=1080p) to rawClipPath. */
-async function downloadViaYtDlpFallback(
+/**
+ * Authenticated yt-dlp download: retry the source video directly against
+ * YouTube using the owner's YouTube OAuth access token (from the `youtube_auth`
+ * request cookie). YouTube treats authenticated requests differently from the
+ * anonymous ones Piped/Supadata make, so this bypasses the "Sign in to confirm
+ * you're not a bot" block that Piped's lone live instance currently hits for
+ * the owner's source videos.
+ *
+ * Returns `tried: false` when no valid token is present (caller skips straight
+ * to Supadata); `tried: true` once a real authenticated attempt has been made.
+ */
+export async function tryYtDlpAuthenticated(
   videoUrl: string,
-  rawClipPath: string
+  rawClipPath: string,
+  cookieHeader: string | null
+): Promise<DownloadOutcome & { tried: boolean }> {
+  const auth = cookieHeader ? await getValidAccessToken(cookieHeader) : null;
+  if (!auth) {
+    console.log(
+      "[ClipFlow] No YouTube OAuth token in cookie - skipping authenticated yt-dlp path."
+    );
+    return { ok: false, error: "No YouTube OAuth token in cookie.", tried: false };
+  }
+  console.log(
+    "[ClipFlow] Piped failed; retrying download via AUTHENTICATED yt-dlp with the owner's YouTube OAuth."
+  );
+  const outcome = await downloadViaYtDlpFallback(
+    videoUrl,
+    rawClipPath,
+    auth.accessToken
+  );
+  return { ...outcome, tried: true };
+}
+/** yt-dlp download of the full video (best <=1080p) to rawClipPath.
+ *  When `authBearer` is provided, the owner's YouTube OAuth access token is
+ *  attached as an Authorization: Bearer header so the request is treated as
+ *  authenticated (bypassing the anonymous bot-check). */
+export async function downloadViaYtDlpFallback(
+  videoUrl: string,
+  rawClipPath: string,
+  authBearer: string | null = null
 ): Promise<DownloadOutcome> {
   try {
+    const header = authBearer
+      ? `--add-header "Authorization: Bearer ${authBearer}"`
+      : "";
     const dlResult = await Bun.$`yt-dlp \
       -f "best[height<=1080]" \
       -o ${rawClipPath} \
       --no-playlist \
       --no-warnings \
+      ${header} \
       ${videoUrl}`
-      .quiet()
       .nothrow();
-
     if (dlResult.exitCode !== 0) {
+      const stderr = (
+        dlResult.stderr?.toString?.() ?? String(dlResult.stderr ?? "")
+      ).toLowerCase();
+      if (authBearer) {
+        if (stderr.includes("sign in to confirm")) {
+          return {
+            ok: false,
+            error:
+              "Download failed even while signed in with your connected YouTube account. The video may be age-restricted or otherwise restricted from direct download (YouTube still enforced a sign-in/membership wall).",
+          };
+        }
+        if (
+          stderr.includes("members-only") ||
+          stderr.includes("private video")
+        ) {
+          return {
+            ok: false,
+            error:
+              "This video is members-only/private and cannot be downloaded even when signed in with your connected account.",
+          };
+        }
+        return {
+          ok: false,
+          error:
+            "Authenticated download failed. The video could not be downloaded even with your connected YouTube account.",
+        };
+      }
       return {
         ok: false,
         error:
-          "Failed to download the video. Supadata download failed and the yt-dlp fallback is blocked on this host (YouTube bot detection).",
+          "Failed to download the video. Supadata download failed and the anonymous yt-dlp fallback is blocked on this host (YouTube bot detection).",
       };
     }
     const file = Bun.file(rawClipPath);
