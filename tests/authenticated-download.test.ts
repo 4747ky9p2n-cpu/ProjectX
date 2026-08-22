@@ -13,11 +13,11 @@
  *     its bot-block message.
  *
  * All network/process work is mocked (never hits the network): global fetch,
- * Bun.$, Bun.file, and getValidAccessToken.
+ * Bun.$, and Bun.file.
  *
  * Run with: bun test tests/authenticated-download.test.ts
  */
-import { describe, test, expect, mock, afterEach } from "bun:test";
+import { describe, test, expect, afterEach } from "bun:test";
 import {
   downloadSourceVideo,
   downloadViaYtDlpFallback,
@@ -34,19 +34,12 @@ const COOKIE =
   "youtube_auth=" +
     encodeURIComponent(
       JSON.stringify({
-        access_token: "at",
+        access_token: "TEST_ACCESS",
         refresh_token: "rt",
         expiry: Date.now() + 3_600_000,
       })
     );
 
-/** Mocked getValidAccessToken; implementation toggled per test. */
-const getValidAccessTokenMock = mock(
-  async (_cookie: string | null): Promise<{ accessToken: string } | null> => null
-);
-mock.module("../src/lib/youtube-auth", () => ({
-  getValidAccessToken: getValidAccessTokenMock,
-}));
 
 /** Record yt-dlp invocations and return a controllable result. */
 let ytdlpCalls: { header: string | null; separate: boolean }[] = [];
@@ -105,7 +98,6 @@ afterEach(() => {
   Bun.$ = origDollar;
   Bun.file = origFile;
   globalThis.fetch = origFetch;
-  getValidAccessTokenMock.mockImplementation(async () => null);
 });
 
 describe("downloadViaYtDlpFallback error mapping", () => {
@@ -162,9 +154,6 @@ describe("downloadViaYtDlpFallback error mapping", () => {
 
 describe("tryYtDlpAuthenticated", () => {
   test("with a token in the cookie -> threads it into yt-dlp, tried:true", async () => {
-    getValidAccessTokenMock.mockImplementation(async () => ({
-      accessToken: "TEST_ACCESS",
-    }));
     ytdlpResult = { exitCode: 0, stderr: "" };
     makeYtDlpCapture();
     makeBunFileMock(true, 1_000_000);
@@ -175,7 +164,6 @@ describe("tryYtDlpAuthenticated", () => {
   });
 
   test("no token in the cookie -> skipped (tried:false), yt-dlp never invoked", async () => {
-    getValidAccessTokenMock.mockImplementation(async () => null);
     makeYtDlpCapture();
     makeBunFileMock();
     const r = await tryYtDlpAuthenticated(URL, "/tmp/x.mp4", null);
@@ -189,9 +177,6 @@ describe("downloadSourceVideo fallback ordering", () => {
     // If ordering were wrong (Supadata before authenticated), the 429 limit
     // error would short-circuit and we'd get a failure. Getting ok:true proves
     // the authenticated path ran first and won.
-    getValidAccessTokenMock.mockImplementation(async () => ({
-      accessToken: "TEST_ACCESS",
-    }));
     ytdlpResult = { exitCode: 0, stderr: "" };
     makeYtDlpCapture();
     makeBunFileMock(true, 1_000_000);
@@ -203,7 +188,6 @@ describe("downloadSourceVideo fallback ordering", () => {
   });
 
   test("Piped fails + no token -> authenticated skipped, falls through to Supadata (limit error)", async () => {
-    getValidAccessTokenMock.mockImplementation(async () => null);
     makeYtDlpCapture();
     makeBunFileMock();
     installFetchMock();
@@ -249,9 +233,6 @@ describe("composeFinalDownloadError (bot-blocked-with-auth surface)", () => {
 
 describe("downloadSourceVideo aggregated error surface", () => {
   test("Piped fails + authenticated yt-dlp bot-blocked + Supadata limit -> cookies fix surfaced (not a raw Supadata 404)", async () => {
-    getValidAccessTokenMock.mockImplementation(async () => ({
-      accessToken: "TEST_ACCESS",
-    }));
     ytdlpResult = {
       exitCode: 1,
       stderr: "Sign in to confirm you're not a bot",
