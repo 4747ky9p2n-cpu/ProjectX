@@ -22,6 +22,7 @@ import {
   downloadSourceVideo,
   downloadViaYtDlpFallback,
   tryYtDlpAuthenticated,
+  composeFinalDownloadError,
 } from "../src/lib/youtube-upload";
 
 const origDollar = Bun.$;
@@ -68,8 +69,12 @@ function captureImpl(_strings: any, ...values: any[]) {
     header = value.replace(/^Authorization: Bearer /, "") || null;
   }
   ytdlpCalls.push({ header, separate });
+  const result = { exitCode: ytdlpResult.exitCode, stderr: ytdlpResult.stderr };
+  // The downloader chains `.quiet().nothrow()`; `.quiet()` must pass through
+  // while still capturing stderr on the result for error mapping.
   return {
-    nothrow: () => ({ exitCode: ytdlpResult.exitCode, stderr: ytdlpResult.stderr }),
+    quiet: () => ({ nothrow: () => result }),
+    nothrow: () => result,
   };
 }
 function makeYtDlpCapture() {
@@ -206,5 +211,60 @@ describe("downloadSourceVideo fallback ordering", () => {
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.error).toMatch(/limit/i);
     expect(ytdlpCalls.length).toBe(0);
+  });
+});
+
+describe("secret hygiene (authenticated download)", () => {
+  test("the owner's OAuth token never leaks into any returned error", async () => {
+    // Even on total failure, no error string returned to the caller may contain
+    // the bearer token (it must not surface in logs or client-visible output).
+    ytdlpResult = { exitCode: 1, stderr: "Sign in to confirm you're not a bot" };
+    makeYtDlpCapture();
+    makeBunFileMock();
+    const r = await downloadViaYtDlpFallback(URL, "/tmp/x.mp4", "REAL_TOKEN_123");
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error).not.toContain("REAL_TOKEN_123");
+      expect(r.error).not.toContain("Bearer");
+    }
+  });
+});
+
+describe("composeFinalDownloadError (bot-blocked-with-auth surface)", () => {
+  test("bot-blocked-with-auth -> crystal-clear fix (browser cookies)", () => {
+    const msg = composeFinalDownloadError(
+      "Video download failed (Supadata API 404): Not Found",
+      true
+    );
+    expect(msg).toMatch(/browser cookies/i);
+    expect(msg).toMatch(/--cookies/i);
+    expect(msg).toMatch(/connected YouTube account/i);
+  });
+
+  test("not bot-blocked -> underlying message passed through unchanged", () => {
+    const msg = composeFinalDownloadError("Video download failed (Supadata API 404): Not Found", false);
+    expect(msg).toBe("Video download failed (Supadata API 404): Not Found");
+  });
+});
+
+describe("downloadSourceVideo aggregated error surface", () => {
+  test("Piped fails + authenticated yt-dlp bot-blocked + Supadata limit -> cookies fix surfaced (not a raw Supadata 404)", async () => {
+    getValidAccessTokenMock.mockImplementation(async () => ({
+      accessToken: "TEST_ACCESS",
+    }));
+    ytdlpResult = {
+      exitCode: 1,
+      stderr: "Sign in to confirm you're not a bot",
+    };
+    makeYtDlpCapture();
+    makeBunFileMock();
+    installFetchMock(); // Supadata returns 429 limit-exceeded
+    const r = await downloadSourceVideo(URL, "/tmp/x.mp4", COOKIE);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      // The owner must see the actionable fix, not a bare "Supadata API 404".
+      expect(r.error).toMatch(/browser cookies/i);
+      expect(r.error).toMatch(/--cookies/i);
+    }
   });
 });

@@ -143,7 +143,7 @@ export async function handleUploadClip(req: Request): Promise<Response> {
         {
           success: false,
           code: "NO_AUTH",
-          error: "Not connected to YouTube. Connect your channel first.",
+          error: "Not connected to YouTube. Connect or reconnect your channel first.",
         },
         401
       );

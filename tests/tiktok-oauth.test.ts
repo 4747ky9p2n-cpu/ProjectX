@@ -3,7 +3,7 @@
  * refresh tokens), OAuth flow shape, missing-secrets degradation.
  * Run with: bun test tests/tiktok-oauth.test.ts
  */
-import { describe, test, expect, beforeEach, afterEach } from "bun:test";
+import { describe, test, expect, afterEach } from "bun:test";
 import {
   parseTikTokTokens,
   getValidTikTokToken,

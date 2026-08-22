@@ -188,7 +188,7 @@ describe("handleUploadClip 202 background contract", () => {
     // would time out. Returning 202 while it is still pending proves the
     // pipeline runs fire-and-forget.
     uploadClipMock.mockImplementation(
-      (_input: unknown, _cookie: string | null) =>
+      async (): Promise<MockOutcome> =>
         new Promise<MockOutcome>((res) => {
           resolvePipeline = res;
         })
