@@ -123,10 +123,25 @@ export type UploadClipOutcome = UploadClipResult | UploadClipError;
    Tool Detection
    ───────────────────────────────────────────── */
 
-let toolCheckCache: { ytdlp: boolean; ffmpeg: boolean } | null = null;
+// Tool detection is cached briefly, but NEVER cached when a tool is missing:
+// a machine swap can silently remove ffmpeg/yt-dlp and re-install them later,
+// so a permanent stale cache would keep reporting MISSING_TOOLS until a server
+// restart (and conversely a permanent 'present' cache would hide a re-swap).
+// We short-circuit only when both tools were just confirmed present within the
+// TTL; otherwise we re-probe (the probes are cheap `which` calls).
+const TOOL_CHECK_TTL_MS = 30_000;
+let toolCheckCache: { ytdlp: boolean; ffmpeg: boolean; at: number } | null = null;
 
 async function checkTools(): Promise<{ ytdlp: boolean; ffmpeg: boolean }> {
-  if (toolCheckCache) return toolCheckCache;
+  const cached = toolCheckCache;
+  if (
+    cached &&
+    Date.now() - cached.at < TOOL_CHECK_TTL_MS &&
+    cached.ytdlp &&
+    cached.ffmpeg
+  ) {
+    return cached;
+  }
 
   const [ytdlpOk, ffmpegOk] = await Promise.all([
     Bun.$`which yt-dlp`.quiet().nothrow()
@@ -137,7 +152,7 @@ async function checkTools(): Promise<{ ytdlp: boolean; ffmpeg: boolean }> {
       .catch(() => false),
   ]);
 
-  toolCheckCache = { ytdlp: ytdlpOk, ffmpeg: ffmpegOk };
+  toolCheckCache = { ytdlp: ytdlpOk, ffmpeg: ffmpegOk, at: Date.now() };
   return toolCheckCache;
 }
 
@@ -205,7 +220,7 @@ export async function uploadClip(
     return {
       success: false,
       code: "NO_AUTH",
-      error: "Not connected to YouTube. Connect your channel first.",
+      error: "Not connected to YouTube. Connect or reconnect your channel first.",
     };
   }
   if (destination === "tiktok" && !tiktokConfigured) {
@@ -722,6 +737,12 @@ interface DownloadSuccess {
 interface DownloadFailure {
   ok: false;
   error: string;
+  /**
+   * Machine-readable cause, when known, so the caller can tell distinct
+   * failures apart (e.g. YouTube's anti-bot wall vs members-only vs a
+   * Supadata plan limit) and surface an actionable message.
+   */
+  cause?: "bot-blocked" | "members-only" | "supadata-limit" | "supadata-unavailable";
 }
 
 type DownloadOutcome = DownloadSuccess | DownloadFailure;
@@ -757,6 +778,7 @@ export async function downloadSourceVideo(
   // YouTube treats authenticated requests differently, so retry directly with
   // the owner's OAuth access token (read from the youtube_auth request cookie),
   // which bypasses the bot-check. Only attempted when a valid token exists.
+  let botBlockedWithAuth = false;
   const authenticated = await tryYtDlpAuthenticated(
     videoUrl,
     rawClipPath,
@@ -767,6 +789,7 @@ export async function downloadSourceVideo(
     console.error(
       `[ClipFlow] Authenticated yt-dlp download failed: ${authenticated.error}`
     );
+    if (authenticated.cause === "bot-blocked") botBlockedWithAuth = true;
   }
 
   // ── Fallback 2: Supadata download API ──
@@ -789,7 +812,10 @@ export async function downloadSourceVideo(
             "[ClipFlow] Supadata download response had no URL field:",
             JSON.stringify(data).slice(0, 500)
           );
-          return await downloadViaYtDlpFallback(videoUrl, rawClipPath);
+          return finalOr(
+            await downloadViaYtDlpFallback(videoUrl, rawClipPath),
+            botBlockedWithAuth
+          );
         }
         await downloadVideoBytes(downloadUrl, rawClipPath);
       }
@@ -805,12 +831,18 @@ export async function downloadSourceVideo(
             "Downloaded video file is empty. The source video may be unavailable or restricted.",
         };
       }
-      return await downloadViaYtDlpFallback(videoUrl, rawClipPath);
+      return finalOr(
+        await downloadViaYtDlpFallback(videoUrl, rawClipPath),
+        botBlockedWithAuth
+      );
     } catch (err) {
       // The download URL fetch failed (network error, timeout, dead link).
       // Keep yt-dlp as a fallback ONLY in this case.
       console.error("[ClipFlow] Supadata video download failed:", err);
-      return await downloadViaYtDlpFallback(videoUrl, rawClipPath);
+      return finalOr(
+        await downloadViaYtDlpFallback(videoUrl, rawClipPath),
+        botBlockedWithAuth
+      );
     }
   }
 
@@ -822,10 +854,51 @@ export async function downloadSourceVideo(
   // once the plan is upgraded (or the endpoint becomes available).
   console.error(`[ClipFlow] Supadata download API error: ${res.error}`);
   if (res.kind === "limit" || res.kind === "4xx") {
-    return { ok: false, error: res.error };
+    return {
+      ok: false,
+      error: composeFinalDownloadError(res.error, botBlockedWithAuth),
+    };
   }
   // 5xx / network failure: try the yt-dlp fallback as a last resort.
-  return await downloadViaYtDlpFallback(videoUrl, rawClipPath);
+  return finalOr(
+    await downloadViaYtDlpFallback(videoUrl, rawClipPath),
+    botBlockedWithAuth
+  );
+}
+
+/**
+ * Compose a clear, actionable download error once every fallback has failed.
+ * When the connected-account yt-dlp attempt was itself blocked by YouTube's
+ * anti-bot/membership wall, the owner needs to know the actual fix (full
+ * browser cookies for yt-dlp, and/or a Supadata upgrade). Otherwise we pass
+ * the underlying error through unchanged so distinct cases keep distinct
+ * messages.
+ */
+export function composeFinalDownloadError(
+  lastError: string,
+  botBlockedWithAuth: boolean
+): string {
+  if (!botBlockedWithAuth) return lastError;
+  return (
+    "Could not download this video: even with your connected YouTube account, " +
+    "YouTube still blocks the download (anti-bot/membership wall), and the free " +
+    "Piped/Supadata fallbacks also failed. To download THIS video the owner must " +
+    "provide full browser cookies for yt-dlp (export a cookies.txt from a " +
+    "logged-in browser and pass it via --cookies), or upgrade the Supadata plan. " +
+    `[underlying: ${lastError}]`
+  );
+}
+
+/** Wrap a DownloadOutcome, replacing only the failure message with the composed one. */
+function finalOr(
+  outcome: DownloadOutcome,
+  botBlockedWithAuth: boolean
+): DownloadOutcome {
+  if (outcome.ok) return outcome;
+  return {
+    ok: false,
+    error: composeFinalDownloadError(outcome.error, botBlockedWithAuth),
+  };
 }
 
 /**
@@ -1127,6 +1200,7 @@ export async function downloadViaYtDlpFallback(
       --no-warnings \
       ${headerArgs} \
       ${videoUrl}`
+      .quiet()
       .nothrow();
     if (dlResult.exitCode !== 0) {
       const stderr = (
@@ -1136,6 +1210,7 @@ export async function downloadViaYtDlpFallback(
         if (stderr.includes("sign in to confirm")) {
           return {
             ok: false,
+            cause: "bot-blocked",
             error:
               "Download failed even while signed in with your connected YouTube account. The video may be age-restricted or otherwise restricted from direct download (YouTube still enforced a sign-in/membership wall).",
           };
@@ -1146,6 +1221,7 @@ export async function downloadViaYtDlpFallback(
         ) {
           return {
             ok: false,
+            cause: "members-only",
             error:
               "This video is members-only/private and cannot be downloaded even when signed in with your connected account.",
           };

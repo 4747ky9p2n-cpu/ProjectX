@@ -16,6 +16,7 @@ import {
   handleChannelInfo,
 } from "./src/lib/oauth-handlers";
 import { handleUploadClip } from "./src/lib/upload-handler";
+import { getToolStatus } from "./src/lib/youtube-upload";
 import { handleChannelVideos } from "./src/lib/channel-handler";
 import {
   handleTikTokAuthInitiate,
@@ -108,3 +109,48 @@ for (let attempt = 1; ; attempt++) {
 }
 
 console.log(`team-site serving on http://${HOST}:${String(PORT)}`);
+void startupDiagnostics();
+
+/**
+ * Run once on server start to make a machine swap (which silently removes
+ * ffmpeg/yt-dlp and stops the server) loudly detectable the MOMENT the site is
+ * re-published — a clear WARNING lands in .run/server.log immediately instead
+ * of only surfacing when a user hits a failed upload. Also sweeps stale
+ * /tmp/clipflow-* dirs left behind by an upload that was interrupted by a
+ * process kill/swap (the pipeline itself already cleans up on normal paths).
+ */
+async function startupDiagnostics(): Promise<void> {
+  try {
+    const tools = await getToolStatus();
+    if (tools.ffmpeg && tools.ytdlp) {
+      console.log(`[ClipFlow] Startup tool check OK: ${tools.message}`);
+    } else {
+      console.error(
+        `[ClipFlow] STARTUP WARNING: ${tools.message}. ` +
+        `${tools.ffmpeg ? "" : "Install ffmpeg with: sudo apt-get update && sudo apt-get install -y ffmpeg. "}` +
+        `${tools.ytdlp ? "" : "Install yt-dlp with: sudo pip3 install --break-system-packages yt-dlp. "}` +
+        "Uploads will fail with MISSING_TOOLS until both are installed. See SETUP.md."
+      );
+    }
+  } catch (err) {
+    console.error("[ClipFlow] Startup tool check failed:", err);
+  }
+  try {
+    const { stdout } = await Bun
+      .$`find /tmp -maxdepth 1 -type d -name "clipflow-*" -mmin +60`
+      .quiet()
+      .nothrow();
+    const dirs = String(stdout ?? "")
+      .split("\n")
+      .map((d) => d.trim())
+      .filter(Boolean);
+    for (const d of dirs) {
+      await Bun.$`rm -rf ${d}`.quiet().nothrow();
+    }
+    if (dirs.length > 0) {
+      console.log(`[ClipFlow] Cleaned ${dirs.length} stale clipflow temp dir(s) at startup`);
+    }
+  } catch {
+    // Non-fatal: temp cleanup must never prevent the server from starting.
+  }
+}
