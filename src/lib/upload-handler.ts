@@ -31,6 +31,7 @@ import {
   getValidTikTokToken,
   tiktokSetupPending,
 } from "./tiktok-auth";
+import { enqueueUpload } from "./upload-queue";
 
 const JSON_HEADERS: Record<string, string> = {
   "Content-Type": "application/json",
@@ -185,40 +186,50 @@ export async function handleUploadClip(req: Request): Promise<Response> {
     // The pipeline is intentionally NOT awaited. Final outcome/errors are
     // logged server-side so a run that fails after acceptance is diagnosable
     // from .run/server.log.
+    //
+    // Pipelines are serialized through a process-wide queue so only ONE clip
+    // pipeline runs at a time (parallel runs overwhelmed the single alive Piped
+    // download instance into HTTP 500s). Enqueueing is synchronous and
+    // non-blocking — the 202 response is still returned immediately no matter
+    // how busy the queue is. The task closure captures `body` and
+    // `backgroundCookie` right here (AT ENQUEUE TIME), so a later job's TikTok
+    // refresh-token rotation can never leak into this job.
     const rotatedTikTokCookie = tiktokAuth?.freshCookie;
     const backgroundCookie = rotatedTikTokCookie
       ? withRotatedTikTokCookie(cookieHeader, rotatedTikTokCookie)
       : cookieHeader;
 
-    void uploadClip(body, backgroundCookie)
-      .then((outcome: UploadClipOutcome) => {
-        if (outcome.success) {
-          console.log(
-            "[ClipFlow] Background upload finished:",
-            JSON.stringify(outcome).slice(0, 500)
-          );
-          const freshCookie = (outcome as UploadClipResult).tiktokFreshCookie;
-          if (freshCookie) {
-            // The 202 response was already sent, so a rotation that happened
-            // DURING the pipeline cannot be persisted. Rare (the access token
-            // would have to expire mid-pipeline); the next upload's sync check
-            // rotates the (stale) cookie token again.
+    enqueueUpload(async () => {
+      await uploadClip(body, backgroundCookie)
+        .then((outcome: UploadClipOutcome) => {
+          if (outcome.success) {
+            console.log(
+              "[ClipFlow] Background upload finished:",
+              JSON.stringify(outcome).slice(0, 500)
+            );
+            const freshCookie = (outcome as UploadClipResult).tiktokFreshCookie;
+            if (freshCookie) {
+              // The 202 response was already sent, so a rotation that happened
+              // DURING the pipeline cannot be persisted. Rare (the access token
+              // would have to expire mid-pipeline); the next upload's sync check
+              // rotates the (stale) cookie token again.
+              console.error(
+                "[ClipFlow] Background upload rotated the TikTok refresh token after the 202 response was sent — rotated token NOT persisted; the next upload will refresh again."
+              );
+            }
+          } else {
             console.error(
-              "[ClipFlow] Background upload rotated the TikTok refresh token after the 202 response was sent — rotated token NOT persisted; the next upload will refresh again."
+              "[ClipFlow] Background upload failed:",
+              outcome.code,
+              "-",
+              outcome.error
             );
           }
-        } else {
-          console.error(
-            "[ClipFlow] Background upload failed:",
-            outcome.code,
-            "-",
-            outcome.error
-          );
-        }
-      })
-      .catch((err: unknown) => {
-        console.error("[ClipFlow] Background upload crashed:", err);
-      });
+        })
+        .catch((err: unknown) => {
+          console.error("[ClipFlow] Background upload crashed:", err);
+        });
+    });
 
     const response = new Response(
       JSON.stringify({
