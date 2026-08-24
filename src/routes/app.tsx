@@ -947,6 +947,24 @@ function ResultsSection({
     [result.videoDuration]
   );
 
+  // Preview gating: a clip's upload stays disabled until the user has seen
+  // the exact clip range. `previewed[i]` records that the user watched it;
+  // `previewIndex` controls which clip's player is currently expanded.
+  const [previewIndex, setPreviewIndex] = useState<number | null>(null);
+  const [previewed, setPreviewed] = useState<boolean[]>(
+    () => result.clips.map(() => false)
+  );
+
+  const handlePreview = useCallback((clipIndex: number) => {
+    // Mark this clip as previewed and expand its player (only one at a time).
+    setPreviewed((prev) => {
+      const next = [...prev];
+      next[clipIndex] = true;
+      return next;
+    });
+    setPreviewIndex((cur) => (cur === clipIndex ? null : clipIndex));
+  }, []);
+
   const handleUpload = useCallback(
     async (clipIndex: number) => {
       const clip = clips[clipIndex];
@@ -1180,11 +1198,15 @@ function ResultsSection({
             key={i}
             clip={clip}
             index={i + 1}
+            videoId={result.videoId}
             isConnected={isConnected}
             tiktokConnected={tiktokConnected}
             tiktokSetupPending={tiktokSetupPending}
             destination={destination}
             uploadState={uploadStates[i] || { status: "idle" }}
+            previewOpen={previewIndex === i}
+            previewed={previewed[i]}
+            onPreview={() => handlePreview(i)}
             onUpload={() => handleUpload(i)}
             onRetry={() => handleRetry(i)}
             onRelength={(length) => handleRelength(i, length)}
@@ -1202,22 +1224,30 @@ function ResultsSection({
 function ClipCard({
   clip,
   index,
+  videoId,
   isConnected,
   tiktokConnected,
   tiktokSetupPending,
   destination,
   uploadState,
+  previewOpen,
+  previewed,
+  onPreview,
   onUpload,
   onRetry,
   onRelength,
 }: {
   clip: ClipSuggestion;
   index: number;
+  videoId: string;
   isConnected: boolean;
   tiktokConnected: boolean;
   tiktokSetupPending: boolean;
   destination: Destination;
   uploadState: ClipUploadState;
+  previewOpen: boolean;
+  previewed: boolean;
+  onPreview: () => void;
   onUpload: () => void;
   onRetry: () => void;
   onRelength?: (length: ClipLength) => void;
@@ -1319,11 +1349,50 @@ function ClipCard({
             </div>
           )}
 
-          {/* Upload button — available when at least one channel is connected */}
+          {/* Preview step — the user sees the exact clip range before upload.
+              The player is only rendered once the user asks for a preview. */}
+          <div>
+            <div className="mb-2 flex flex-wrap items-center justify-between gap-3">
+              <span className="text-[11px] font-semibold uppercase tracking-wider text-red-400">
+                Preview deines Clips / Preview your clip
+              </span>
+              <span className="rounded-md bg-white/[0.06] px-2 py-0.5 font-mono text-[11px] text-gray-400">
+                {formatTime(clip.startTime)} → {formatTime(clip.endTime)} ·{" "}
+                {formatDuration(clip.duration)} · Short
+              </span>
+            </div>
+
+            {previewOpen ? (
+              <ClipVideoPreview
+                videoId={videoId}
+                startTime={clip.startTime}
+                endTime={clip.endTime}
+              />
+            ) : (
+              <button
+                type="button"
+                onClick={onPreview}
+                className="mb-4 inline-flex items-center gap-2 rounded-lg border border-red-500/40 bg-red-500/10 px-4 py-2 text-sm font-medium text-red-400 transition-all hover:bg-red-500/20 hover:text-red-300 active:scale-95"
+              >
+                <PlayIcon />
+                Preview clip
+              </button>
+            )}
+
+            <p className="mb-4 max-w-md text-[11px] leading-relaxed text-gray-500">
+              So wird dein Clip als Short gepostet. Prüfe den Ausschnitt, bevor
+              du ihn hochlädst — der Upload bleibt erst nach der Vorschau
+              möglich.
+            </p>
+          </div>
+
+          {/* Upload button — available when at least one channel is connected.
+              Gated: disabled until the clip has been previewed. */}
           {isConnected || tiktokConnected ? (
             <UploadButton
               uploadState={uploadState}
               destination={destination}
+              previewed={previewed}
               onUpload={onUpload}
               onRetry={onRetry}
             />
@@ -1358,17 +1427,55 @@ function ClipCard({
 }
 
 /* ─────────────────────────────────────────────
+   Clip Video Preview
+   ───────────────────────────────────────────── */
+
+function ClipVideoPreview({
+  videoId,
+  startTime,
+  endTime,
+}: {
+  videoId: string;
+  startTime: number;
+  endTime: number;
+}) {
+  // YouTube has no public direct .mp4 URL a browser <video> tag can use, so we
+  // reuse the platform's own embed player, seeked to the exact clip range via
+  // the start/end query params. This is what the upload pipeline clips.
+  const src =
+    `https://www.youtube.com/embed/${videoId}` +
+    `?start=${Math.floor(startTime)}` +
+    `&end=${Math.max(Math.floor(endTime), Math.floor(startTime) + 1)}` +
+    `&autoplay=1&rel=0&modestbranding=1`;
+  return (
+    <div className="mb-4 overflow-hidden rounded-xl border border-white/5 bg-black">
+      <div className="relative aspect-video w-full sm:max-w-lg">
+        <iframe
+          src={src}
+          title="Clip preview"
+          allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+          allowFullScreen
+          className="absolute inset-0 h-full w-full"
+        />
+      </div>
+    </div>
+  );
+}
+
+/* ─────────────────────────────────────────────
    Upload Button
    ───────────────────────────────────────────── */
 
 function UploadButton({
   uploadState,
   destination,
+  previewed,
   onUpload,
   onRetry,
 }: {
   uploadState: ClipUploadState;
   destination: Destination;
+  previewed: boolean;
   onUpload: () => void;
   onRetry: () => void;
 }) {
@@ -1513,7 +1620,8 @@ function UploadButton({
     );
   }
 
-  // idle — label reflects the selected destination
+  // idle — label reflects the selected destination. Disabled until the clip
+  // has been previewed.
   const idleLabel =
     destLabel === "both"
       ? "Upload to YouTube + TikTok"
@@ -1521,19 +1629,44 @@ function UploadButton({
         ? "Upload to TikTok"
         : "Upload to YouTube";
   return (
-    <button
-      onClick={onUpload}
-      className="inline-flex items-center gap-2 rounded-lg border border-white/10 bg-white/[0.05] px-4 py-2 text-sm font-medium text-white transition-all hover:border-red-500/30 hover:bg-red-500/10 hover:text-red-400 active:scale-95"
-    >
-      {destLabel === "tiktok" ? <TikTokIcon /> : <UploadToYouTubeIcon />}
-      {idleLabel}
-    </button>
+    <div className="flex flex-wrap items-center gap-3">
+      <button
+        onClick={onUpload}
+        disabled={!previewed}
+        title={previewed ? idleLabel : "Preview the clip first to unlock upload"}
+        className={`inline-flex items-center gap-2 rounded-lg border px-4 py-2 text-sm font-medium transition-all active:scale-95 ${
+          previewed
+            ? "border-white/10 bg-white/[0.05] text-white hover:border-red-500/30 hover:bg-red-500/10 hover:text-red-400"
+            : "cursor-not-allowed border-white/5 bg-white/[0.02] text-gray-600"
+        }`}
+      >
+        {destLabel === "tiktok" ? <TikTokIcon /> : <UploadToYouTubeIcon />}
+        {idleLabel}
+      </button>
+      {!previewed && (
+        <span className="text-[11px] text-gray-600">
+          Preview zuerst / preview first
+        </span>
+      )}
+    </div>
   );
 }
 
 /* ─────────────────────────────────────────────
    Icons
    ───────────────────────────────────────────── */
+
+function PlayIcon() {
+  return (
+    <svg
+      className="h-4 w-4"
+      fill="currentColor"
+      viewBox="0 0 24 24"
+    >
+      <path d="M8 5.14v13.72c0 .8.87 1.3 1.56.9l10.98-6.86a1.05 1.05 0 0 0 0-1.8L9.56 4.24A1.05 1.05 0 0 0 8 5.14Z" />
+    </svg>
+  );
+}
 
 function SearchIcon() {
   return (
