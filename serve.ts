@@ -16,6 +16,10 @@ import {
   handleChannelInfo,
 } from "./src/lib/oauth-handlers";
 import { handleUploadClip } from "./src/lib/upload-handler";
+import {
+  handleVoiceRender,
+  handleVoiceCharacters,
+} from "./src/lib/voice-handler";
 import { getToolStatus } from "./src/lib/youtube-upload";
 import { handleChannelVideos } from "./src/lib/channel-handler";
 import {
@@ -84,6 +88,12 @@ for (let attempt = 1; ; attempt++) {
         }
         if (pathname === "/api/upload/clip" && req.method === "POST") {
           return handleUploadClip(req);
+        }
+        if (pathname === "/api/voice/characters" && req.method === "GET") {
+          return handleVoiceCharacters();
+        }
+        if (pathname === "/api/voice/render" && req.method === "POST") {
+          return handleVoiceRender(req);
         }
         if (
           pathname === "/api/youtube/channel/videos" &&
