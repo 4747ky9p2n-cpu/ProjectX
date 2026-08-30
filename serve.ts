@@ -19,6 +19,8 @@ import { handleUploadClip } from "./src/lib/upload-handler";
 import {
   handleVoiceRender,
   handleVoiceCharacters,
+  handleVoiceMedia,
+  handleVoiceFact,
 } from "./src/lib/voice-handler";
 import { getToolStatus } from "./src/lib/youtube-upload";
 import { handleChannelVideos } from "./src/lib/channel-handler";
@@ -94,6 +96,12 @@ for (let attempt = 1; ; attempt++) {
         }
         if (pathname === "/api/voice/render" && req.method === "POST") {
           return handleVoiceRender(req);
+        }
+        if (pathname === "/api/voice/fact" && req.method === "POST") {
+          return handleVoiceFact(req);
+        }
+        if (pathname === "/api/voice/media" && req.method === "GET") {
+          return handleVoiceMedia(req);
         }
         if (
           pathname === "/api/youtube/channel/videos" &&

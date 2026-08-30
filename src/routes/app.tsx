@@ -263,6 +263,7 @@ function AppPage() {
   const [clipLength, setClipLength] = useState<ClipLength>(DEFAULT_CLIP_LENGTH);
   const [state, setState] = useState<AppState>({ kind: "idle" });
   const [mode, setMode] = useState<InputMode>("url");
+  const [view, setView] = useState<"clip" | "voice">("clip");
   const [channelQuery, setChannelQuery] = useState("");
   const [channelState, setChannelState] = useState<ChannelFetchState>({
     kind: "idle",
@@ -577,6 +578,33 @@ function AppPage() {
       )}
 
       <main className="mx-auto max-w-5xl px-6 py-12">
+        {/* ── Category tabs: Clip-Auto vs KI-Stimme ── */}
+        <div className="mb-8 flex flex-wrap items-center gap-2 rounded-xl border border-white/10 bg-white/[0.04] p-1">
+          <button
+            type="button"
+            onClick={() => setView("clip")}
+            className={`rounded-lg px-4 py-1.5 text-sm font-medium transition-all ${
+              view === "clip"
+                ? "bg-gradient-to-r from-red-600 to-purple-600 text-white shadow"
+                : "text-gray-400 hover:text-white"
+            }`}
+          >
+            ✂️ Clip-Auto
+          </button>
+          <button
+            type="button"
+            onClick={() => setView("voice")}
+            className={`rounded-lg px-4 py-1.5 text-sm font-medium transition-all ${
+              view === "voice"
+                ? "bg-gradient-to-r from-red-600 to-purple-600 text-white shadow"
+                : "text-gray-400 hover:text-white"
+            }`}
+          >
+            🎙️ KI-Stimme
+          </button>
+        </div>
+        {view === "clip" ? (
+        <>
         {/* ── Input Section ── */}
         <section className="mb-12">
           <h1 className="mb-3 text-3xl font-bold tracking-tight sm:text-4xl">
@@ -785,8 +813,501 @@ function AppPage() {
             }}
           />
         )}
+        </>
+        ) : (
+          <VoiceSection
+            isConnected={connection.connected}
+            tiktokConnected={tiktokConnection.connected}
+            tiktokSetupPending={tiktokConnection.setupPending}
+          />
+        )}
       </main>
     </div>
+  );
+}
+
+
+/* ─────────────────────────────────────────────
+   AI-Voice Category (KI-Sprach-Kategorie)
+   Reuses the existing /api/upload/clip 202 contract + UploadButton so the
+   rendered Short is posted through the same honest-status pipeline as
+   Clip-Auto.
+   ───────────────────────────────────────────── */
+interface VoiceCharacter {
+  id: string;
+  name: string;
+  bio: string;
+  emoji: string;
+  style: string;
+  language: string;
+}
+/** Map Phase-1 render error codes to human-friendly German messages. */
+function voiceErrorLabel(code: string | undefined, fallback: string | undefined): string {
+  switch (code) {
+    case "MISSING_TOOLS":
+      return "TTS-Modell nicht installiert – Piper & ffmpeg fehlen auf dem Server.";
+    case "TTS_MODEL_UNAVAILABLE":
+      return "Die Stimme des Charakters konnte nicht geladen werden (Modell fehlt).";
+    case "TTS_FAILED":
+      return "Die Sprachsynthese ist fehlgeschlagen. Bitte versuch es erneut.";
+    case "DOWNLOAD_FAILED":
+      return "Das Hintergrundvideo konnte nicht heruntergeladen werden.";
+    case "RENDER_FAILED":
+    case "RENDER_CRASHED":
+      return "Die Erstellung des Shorts ist fehlgeschlagen.";
+    case "FACT_GEN_FAILED":
+      return "Der KI-Fakt konnte nicht generiert werden – bitte Text manuell eingeben.";
+    case "UNKNOWN_CHARACTER":
+      return "Der gewählte Charakter existiert nicht.";
+    case "MISSING_TEXT":
+      return "Bitte gib einen Text ein oder lass die KI einen Fakt generieren.";
+    default:
+      return fallback || "Ein Fehler ist aufgetreten. Bitte versuch es erneut.";
+  }
+}
+function VoiceSection({
+  isConnected,
+  tiktokConnected,
+  tiktokSetupPending,
+}: {
+  isConnected: boolean;
+  tiktokConnected: boolean;
+  tiktokSetupPending: boolean;
+}) {
+  const [videoUrl, setVideoUrl] = useState("");
+  const [characters, setCharacters] = useState<VoiceCharacter[] | null>(null);
+  const [charsError, setCharsError] = useState("");
+  const [characterId, setCharacterId] = useState("");
+  const [text, setText] = useState("");
+  const [genState, setGenState] = useState<"idle" | "loading" | "error">("idle");
+  const [genError, setGenError] = useState("");
+  const [renderState, setRenderState] = useState<
+    "idle" | "loading" | "error" | "done"
+  >("idle");
+  const [renderPath, setRenderPath] = useState("");
+  const [renderText, setRenderText] = useState("");
+  const [renderError, setRenderError] = useState("");
+  const [durationSec, setDurationSec] = useState(0);
+  const [destination, setDestination] = useState<Destination>("youtube");
+  const [uploadState, setUploadState] = useState<ClipUploadState>({
+    status: "idle",
+  });
+
+  useEffect(() => {
+    let active = true;
+    fetch("/api/voice/characters")
+      .then((r) => r.json())
+      .then((d: { success?: boolean; characters?: VoiceCharacter[]; error?: string }) => {
+        if (!active) return;
+        if (d.success && d.characters) setCharacters(d.characters);
+        else setCharsError(d.error || "Konnte Charaktere nicht laden.");
+      })
+      .catch(() => {
+        if (active) setCharsError("Keine Verbindung zum Server.");
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const selectedCharacter = characters?.find((c) => c.id === characterId);
+
+  async function handleGenerateFact() {
+    if (!videoUrl.trim() || !characterId) return;
+    setGenState("loading");
+    setGenError("");
+    try {
+      const resp = await fetch("/api/voice/fact", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ videoUrl: videoUrl.trim(), characterId }),
+      });
+      const data = (await resp.json()) as {
+        success?: boolean;
+        text?: string;
+        code?: string;
+        error?: string;
+      };
+      if (data.success && data.text) {
+        setText(data.text);
+        setGenState("idle");
+      } else {
+        setGenError(
+          data.code === "FACT_GEN_FAILED"
+            ? "Der KI-Fakt konnte nicht generiert werden – bitte Text manuell eingeben."
+            : data.error || "Fakt-Generierung fehlgeschlagen."
+        );
+        setGenState("error");
+      }
+    } catch {
+      setGenError("Keine Verbindung zum Server.");
+      setGenState("error");
+    }
+  }
+
+  async function handleRender() {
+    if (!videoUrl.trim() || !characterId) return;
+    setRenderState("loading");
+    setRenderError("");
+    setUploadState({ status: "idle" });
+    setRenderPath("");
+    setRenderText("");
+    const hasUserText = text.trim().length > 0;
+    try {
+      const resp = await fetch("/api/voice/render", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          videoUrl: videoUrl.trim(),
+          characterId,
+          ...(hasUserText
+            ? { text: text.trim(), factSource: "user" }
+            : { factSource: "ai" }),
+          maxDuration: 60,
+        }),
+      });
+      const data = (await resp.json()) as {
+        success?: boolean;
+        path?: string;
+        text?: string;
+        durationSec?: number;
+        code?: string;
+        error?: string;
+      };
+      if (data.success && data.path) {
+        setRenderPath(data.path);
+        setRenderText(data.text || text);
+        setDurationSec(data.durationSec || 0);
+        setRenderState("done");
+      } else {
+        setRenderError(voiceErrorLabel(data.code, data.error));
+        setRenderState("error");
+      }
+    } catch {
+      setRenderError("Keine Verbindung zum Server.");
+      setRenderState("error");
+    }
+  }
+
+  const mediaUrl = renderPath
+    ? `/api/voice/media?path=${encodeURIComponent(renderPath)}`
+    : "";
+
+  async function handleUpload() {
+    if (!renderPath) return;
+    setUploadState({ status: "uploading", destination });
+    try {
+      const resp = await fetch("/api/upload/clip", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          videoUrl: videoUrl.trim(),
+          startTime: 0,
+          endTime: Math.max(durationSec || 5, 5),
+          title: `${selectedCharacter ? selectedCharacter.name + " – " : ""}KI-Stimme Short`,
+          description: renderText
+            ? `${renderText}\n#shorts #clipflow #kistimme`
+            : "#shorts #clipflow #kistimme",
+          destination,
+          renderedPath: renderPath,
+        }),
+      });
+      const data = (await resp.json()) as {
+        success?: boolean;
+        background?: boolean;
+        accepted?: boolean;
+        videoId?: string;
+        videoUrl?: string;
+        destination?: Destination;
+        youtube?: { videoId: string; videoUrl: string };
+        tiktok?: { publishId?: string; videoUrl?: string };
+        partialError?: string;
+        error?: string;
+      };
+      if (resp.status === 202 && data.background) {
+        setUploadState({
+          status: "background",
+          destination: data.destination ?? destination,
+        });
+      } else if (data.success) {
+        setUploadState({
+          status: data.partialError ? "partial" : "success",
+          videoUrl: data.videoUrl,
+          videoId: data.videoId,
+          destination: data.destination,
+          youtube: data.youtube,
+          tiktok: data.tiktok,
+          partialError: data.partialError,
+        });
+      } else {
+        setUploadState({
+          status: "error",
+          errorMessage: data.error || "Upload fehlgeschlagen. Versuch es erneut.",
+        });
+      }
+    } catch {
+      setUploadState({
+        status: "error",
+        errorMessage:
+          "Upload konnte nicht gesendet werden – keine Verbindung zum Server. Versuch es erneut.",
+      });
+    }
+  }
+  const handleRetry = () => setUploadState({ status: "idle" });
+
+  return (
+    <section className="space-y-10">
+      <div>
+        <h2 className="mb-2 text-2xl font-bold tracking-tight sm:text-3xl">
+          <span className="bg-gradient-to-r from-purple-500 to-pink-500 bg-clip-text text-transparent">
+            KI-Sprach-Kategorie
+          </span>
+        </h2>
+        <p className="max-w-2xl text-gray-400">
+          Wähle ein Hintergrundvideo und eine Parodie-Stimme – ClipFlow rendert
+          daraus ein fertiges 9:16-Short mit eingesprochenem Fakt und Untertitel,
+          das du direkt als YouTube/TikTok-Short posten kannst.
+        </p>
+      </div>
+
+      {/* 1. Background video */}
+      <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-6">
+        <h3 className="mb-3 text-sm font-semibold uppercase tracking-wide text-purple-400">
+          1 · Hintergrundvideo
+        </h3>
+        <input
+          type="text"
+          value={videoUrl}
+          onChange={(e) => setVideoUrl(e.target.value)}
+          placeholder="YouTube-URL einfügen (z. B. https://youtube.com/watch?v=...)"
+          className="w-full rounded-xl border border-white/10 bg-white/[0.05] px-5 py-3.5 text-white placeholder-gray-500 outline-none transition-all focus:border-purple-500/50 focus:bg-white/[0.08]"
+        />
+      </div>
+
+      {/* 2. Character picker */}
+      <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-6">
+        <h3 className="mb-3 text-sm font-semibold uppercase tracking-wide text-purple-400">
+          2 · Stimme / Charakter
+        </h3>
+        {charsError ? (
+          <p className="text-sm text-red-400">{charsError}</p>
+        ) : !characters ? (
+          <div className="flex items-center gap-2 text-sm text-gray-500">
+            <Spinner /> Lade Charaktere...
+          </div>
+        ) : (
+          <div className="grid gap-3 sm:grid-cols-2">
+            {characters.map((c) => {
+              const active = c.id === characterId;
+              return (
+                <button
+                  key={c.id}
+                  type="button"
+                  onClick={() => setCharacterId(c.id)}
+                  className={`rounded-xl border p-4 text-left transition-all ${
+                    active
+                      ? "border-purple-500/60 bg-purple-500/10"
+                      : "border-white/10 bg-white/[0.02] hover:border-white/25"
+                  }`}
+                >
+                  <div className="mb-1 flex items-center gap-2">
+                    <span className="text-2xl">{c.emoji}</span>
+                    <span className="font-semibold text-white">{c.name}</span>
+                    <span className="ml-auto rounded-md bg-white/[0.06] px-2 py-0.5 text-[10px] uppercase tracking-wide text-gray-400">
+                      {c.language}
+                    </span>
+                  </div>
+                  <p className="text-xs leading-relaxed text-gray-400">{c.bio}</p>
+                  {active && selectedCharacter && (
+                    <p className="mt-2 text-[11px] text-purple-300/80">
+                      Stil: {selectedCharacter.style}
+                    </p>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      {/* 3. Text / AI fact */}
+      <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-6">
+        <h3 className="mb-3 text-sm font-semibold uppercase tracking-wide text-purple-400">
+          3 · Text
+        </h3>
+        <textarea
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          placeholder="Gib deinen Text ein – oder lass die KI einen viralen Fakt aus dem Video generieren."
+          rows={3}
+          className="w-full rounded-xl border border-white/10 bg-white/[0.05] px-4 py-3 text-white placeholder-gray-500 outline-none transition-all focus:border-purple-500/50 focus:bg-white/[0.08]"
+        />
+        <div className="mt-3 flex flex-wrap items-center gap-3">
+          <button
+            type="button"
+            onClick={handleGenerateFact}
+            disabled={genState === "loading" || !videoUrl.trim() || !characterId}
+            className="inline-flex items-center gap-2 rounded-lg border border-purple-500/40 bg-purple-500/10 px-4 py-2 text-sm font-medium text-purple-300 transition-all hover:bg-purple-500/20 active:scale-95 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {genState === "loading" ? (
+              <>
+                <Spinner /> Generiere Fakt...
+              </>
+            ) : (
+              "🎲 KI-Fakt generieren"
+            )}
+          </button>
+          {renderState === "done" && renderText && (
+            <span className="text-[11px] text-gray-500">
+              Generierter Text wurde unten übernommen – du kannst ihn vor dem
+              Rendern bearbeiten.
+            </span>
+          )}
+        </div>
+        {genState === "error" && (
+          <p className="mt-2 text-xs text-red-400">{genError}</p>
+        )}
+        {(genState === "idle" || genState === "loading") && (text.trim().length > 0 && genState === "idle") && (
+          <p className="mt-2 text-[11px] text-gray-500">
+            Aktuell: eigener Text ({text.length} Zeichen). Ein leerer Text lässt
+            die KI beim Rendern automatisch einen Fakt generieren.
+          </p>
+        )}
+      </div>
+
+      {/* 4. Render */}
+      <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-6">
+        <h3 className="mb-3 text-sm font-semibold uppercase tracking-wide text-purple-400">
+          4 · Short rendern
+        </h3>
+        <button
+          type="button"
+          onClick={handleRender}
+          disabled={
+            renderState === "loading" || !videoUrl.trim() || !characterId
+          }
+          className="inline-flex items-center gap-2 rounded-xl bg-gradient-to-r from-purple-600 to-pink-600 px-6 py-3.5 font-semibold text-white shadow-lg shadow-purple-600/20 transition-all hover:from-purple-500 hover:to-pink-500 active:scale-95 disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          {renderState === "loading" ? (
+            <>
+              <Spinner /> Rendere Short (Download + TTS + ffmpeg)...
+            </>
+          ) : renderState === "done" ? (
+            "↻ Erneut rendern"
+          ) : (
+            "▶ Short rendern"
+          )}
+        </button>
+        {renderState === "loading" && (
+          <p className="mt-3 text-xs text-gray-500">
+            Das kann einige Sekunden dauern – Hintergrundvideo wird geladen und
+            die Stimme erzeugt.
+          </p>
+        )}
+        {renderState === "error" && (
+          <div className="mt-3 flex items-start gap-2 rounded-lg border border-red-500/30 bg-red-500/10 p-3 text-sm text-red-300">
+            <AlertIcon />
+            <span>{renderError}</span>
+          </div>
+        )}
+      </div>
+
+      {/* 5. Preview */}
+      {renderState === "done" && (
+        <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-6">
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+            <h3 className="text-sm font-semibold uppercase tracking-wide text-purple-400">
+              5 · Vorschau
+            </h3>
+            <span className="rounded-md bg-white/[0.06] px-2 py-0.5 font-mono text-[11px] text-gray-400">
+              {durationSec ? `${Math.round(durationSec)}s` : "Short"} · 9:16
+            </span>
+          </div>
+          <div className="mb-4 max-w-sm overflow-hidden rounded-xl border border-white/5 bg-black">
+            <div className="relative aspect-[9/16] w-full">
+              <video
+                key={mediaUrl}
+                src={mediaUrl}
+                controls
+                playsInline
+                className="absolute inset-0 h-full w-full"
+              >
+                Dein Browser unterstützt kein Video-Playback.
+              </video>
+            </div>
+          </div>
+          {renderText && (
+            <p className="mb-4 max-w-lg text-sm leading-relaxed text-gray-300">
+              <span className="text-gray-500">Gesprochener Text:</span>{" "}
+              {renderText}
+            </p>
+          )}
+        </div>
+      )}
+
+      {/* 6. Post */}
+      {renderState === "done" && (
+        <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-6">
+          <h3 className="mb-3 text-sm font-semibold uppercase tracking-wide text-purple-400">
+            6 · Posten
+          </h3>
+          <div className="mb-4 inline-flex rounded-xl border border-white/10 bg-white/[0.04] p-1">
+            {(
+              [
+                { key: "youtube", label: "YouTube" },
+                { key: "tiktok", label: "TikTok" },
+                { key: "both", label: "Beide" },
+              ] as { key: Destination; label: string }[]
+            ).map((d) => (
+              <button
+                key={d.key}
+                type="button"
+                onClick={() => setDestination(d.key)}
+                className={`rounded-lg px-4 py-1.5 text-sm font-medium transition-all ${
+                  destination === d.key
+                    ? "bg-gradient-to-r from-purple-600 to-pink-600 text-white shadow"
+                    : "text-gray-400 hover:text-white"
+                }`}
+              >
+                {d.label}
+              </button>
+            ))}
+          </div>
+          {isConnected || tiktokConnected ? (
+            <UploadButton
+              uploadState={uploadState}
+              destination={destination}
+              previewed={renderState === "done"}
+              onUpload={handleUpload}
+              onRetry={handleRetry}
+            />
+          ) : (
+            <p className="text-xs text-gray-600">
+              {tiktokSetupPending ? (
+                "TikTok: Setup ausstehend (TIKTOK_CLIENT_KEY fehlt) – verbinde zuerst einen Kanal."
+              ) : (
+                <>
+                  <a
+                    href="/api/auth/youtube"
+                    className="text-red-400 hover:text-red-300 transition-colors"
+                  >
+                    Connect YouTube
+                  </a>{" "}
+                  or{" "}
+                  <a
+                    href="/api/auth/tiktok"
+                    className="text-[#25F4EE] hover:underline transition-colors"
+                  >
+                    Connect TikTok
+                  </a>{" "}
+                  to post the rendered Short.
+                </>
+              )}
+            </p>
+          )}
+        </div>
+      )}
+    </section>
   );
 }
 

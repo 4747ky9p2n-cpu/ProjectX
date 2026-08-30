@@ -25,6 +25,7 @@ import {
   type RenderVoiceOutcome,
 } from "./voice-render";
 import { voiceToolStatus } from "./tts";
+import { generateViralFact } from "./factgen";
 import { CHARACTERS } from "./characters";
 
 const JSON_HEADERS: Record<string, string> = {
@@ -43,6 +44,10 @@ export interface VoiceHandlerDeps {
     input: RenderVoiceInput
   ) => Promise<RenderVoiceOutcome>;
   toolCheck?: () => Promise<{ ok: boolean; message: string }>;
+  genFact?: (opts: {
+    videoUrl: string;
+    language: string;
+  }) => Promise<{ text: string }>;
 }
 
 /**
@@ -166,4 +171,117 @@ export async function handleVoiceRender(
     },
     200
   );
+}
+/**
+ * GET /api/voice/media?path=<abs> — serves a rendered voice Short for browser
+ * preview in a <video> tag.
+ *
+ * SAFETY: this deliberately serves files ONLY from the controlled voice render
+ * work directory (/tmp/clipflow-voice-<ts>/short.mp4). The path is validated
+ * with realpath(); any path that does not resolve (after symlink resolution)
+ * under the /tmp/clipflow-voice- prefix — or is not an .mp4 file — is rejected
+ * with 404/400. This never exposes arbitrary files on disk.
+ */
+export async function handleVoiceMedia(req: Request): Promise<Response> {
+  const url = new URL(req.url);
+  const rawPath = url.searchParams.get("path");
+  if (!rawPath) {
+    return jsonResponse(
+      { success: false, code: "API_ERROR", error: "Missing `path` query param." },
+      400
+    );
+  }
+  // Resolve symlinks/.. so a crafted path cannot escape the controlled prefix.
+  let resolved: string;
+  try {
+    resolved = String(
+      (await Bun.$`realpath -m ${rawPath}`.quiet().nothrow()).stdout ?? ""
+    ).trim();
+  } catch {
+    return jsonResponse(
+      { success: false, code: "API_ERROR", error: "Bad path." },
+      400
+    );
+  }
+  if (!resolved.startsWith("/tmp/clipflow-voice-") || !resolved.endsWith(".mp4")) {
+    return jsonResponse(
+      { success: false, code: "NOT_FOUND", error: "No such rendered short." },
+      404
+    );
+  }
+  const file = Bun.file(resolved);
+  if (!(await file.exists())) {
+    return jsonResponse(
+      { success: false, code: "NOT_FOUND", error: "Rendered short not found." },
+      404
+    );
+  }
+  return new Response(file, {
+    headers: {
+      "Content-Type": "video/mp4",
+      "Cache-Control": "private, max-age=300",
+    },
+  });
+}
+
+/**
+ * POST /api/voice/fact — body `{ videoUrl, characterId }`. Cheaply generates a
+ * viral-fact text (from the video transcript, phrased in the character's
+ * language) WITHOUT running the expensive render pipeline. The UI shows this
+ * text for review before committing to /api/voice/render.
+ *
+ * Returns 200 `{ success: true, text }` or 400/404/500 with `code`.
+ */
+export async function handleVoiceFact(
+  req: Request,
+  deps: VoiceHandlerDeps = {}
+): Promise<Response> {
+  let body: { videoUrl?: unknown; characterId?: unknown };
+  try {
+    body = (await req.json()) as { videoUrl?: unknown; characterId?: unknown };
+  } catch {
+    return jsonResponse(
+      { success: false, code: "API_ERROR", error: "Invalid JSON body." },
+      400
+    );
+  }
+  const videoUrl = typeof body.videoUrl === "string" ? body.videoUrl.trim() : "";
+  const characterId =
+    typeof body.characterId === "string" ? body.characterId.trim() : "";
+  if (!videoUrl) {
+    return jsonResponse(
+      { success: false, code: "API_ERROR", error: "videoUrl is required." },
+      400
+    );
+  }
+  if (!characterId) {
+    return jsonResponse(
+      { success: false, code: "API_ERROR", error: "characterId is required." },
+      400
+    );
+  }
+  const character = CHARACTERS.find((c) => c.id === characterId);
+  if (!character) {
+    return jsonResponse(
+      { success: false, code: "UNKNOWN_CHARACTER", error: "Unknown character id." },
+      404
+    );
+  }
+  const genFact = deps.genFact ?? generateViralFact;
+  try {
+    const fact = await genFact({
+      videoUrl,
+      language: character.language,
+    });
+    return jsonResponse({ success: true, text: fact.text }, 200);
+  } catch (err) {
+    return jsonResponse(
+      {
+        success: false,
+        code: "FACT_GEN_FAILED",
+        error: `Could not generate the viral fact: ${(err as Error).message}`,
+      },
+      500
+    );
+  }
 }

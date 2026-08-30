@@ -60,6 +60,14 @@ export interface UploadClipInput {
    * "both" uploads the SAME encoded clip to YouTube and TikTok.
    */
   destination?: UploadDestination;
+  /**
+   * Optional absolute path to an already-rendered Short MP4 (e.g. the output of
+   * the AI-voice render pipeline). When present, the pipeline SKIPS the
+   * download + 9:16 re-encode steps and uploads this file directly — the clip
+   * is already final. The path must live under the controlled voice work dir
+   * (/tmp/clipflow-voice-*); it is validated server-side.
+   */
+  renderedPath?: string;
 }
 
 export type UploadDestination = "youtube" | "tiktok" | "both";
@@ -265,105 +273,131 @@ export async function uploadClip(
   // ── 3. Prepare temp directory ──
   const workDir = `/tmp/clipflow-${Date.now()}`;
   const rawClipPath = `${workDir}/raw.mp4`;
-  const shortPath = `${workDir}/short.mp4`;
+  let shortPath = `${workDir}/short.mp4`;
 
   try {
-    await Bun.$`mkdir -p ${workDir}`.quiet();
-
-    // ── 4. Download source video (Supadata API primary, yt-dlp fallback) ──
-    console.log(`[ClipFlow] Downloading source video: ${input.videoUrl}`);
-    const download = await downloadSourceVideo(
-      input.videoUrl,
-      rawClipPath,
-      cookieHeader
-    );
-    if (!download.ok) {
-      // Clean up
-      await Bun.$`rm -rf ${workDir}`.quiet().nothrow();
-      return {
-        success: false,
-        code: "DOWNLOAD_FAILED",
-        error: download.error,
-      };
-    }
-
-    // ── 5. Cut the clip segment and re-encode to vertical 9:16 Shorts ──
-    // Both download paths produce the FULL source video in raw.mp4, so we
-    // cut the clip with ffmpeg input-seek -ss <start> -t <duration>.
-    const clipStart = input.startTime;
-    const clipDuration = Math.max(0.1, input.endTime - input.startTime);
-    console.log(
-      `[ClipFlow] Encoding to vertical 9:16 Shorts format (start=${clipStart}s, dur=${clipDuration}s)`
-    );
-
-    // Build the video filter chain. crop+scale first (1080×1920 canvas), then
-    // burn in ASS captions AFTER the scale so text is drawn in the final
-    // 1080×1920 coordinate space (large, readable, correctly positioned).
-    let vfChain = "crop=ih*9/16:ih,scale=1080:1920";
-
-    // Optional burned-in captions: use the transcript segments the client
-    // sent for this clip's time window. Missing/invalid/empty segments are
-    // handled gracefully — the clip encodes WITHOUT subtitles.
-    const captionSegments = normalizeCaptionSegments(input.segments);
-    if (captionSegments.length > 0) {
-      if (await assFilterAvailable()) {
-        const assPath = `${workDir}/clip.ass`;
-        const eventCount = await buildAssFile(
-          captionSegments,
-          clipStart,
-          clipDuration,
-          assPath
-        );
-        if (eventCount > 0) {
-          vfChain += `,ass=${assPath}`;
-          console.log(
-            `[ClipFlow] Burning ${eventCount} caption events into Short (ass=${assPath})`
-          );
-        } else {
-          console.log(
-            "[ClipFlow] No caption segments overlap the clip window — encoding without subtitles"
-          );
-        }
-      } else {
-        console.log(
-          "[ClipFlow] libass subtitles unavailable (no ass filter in ffmpeg) — encoding without subtitles"
-        );
+    const renderedPath = (input.renderedPath ?? "").trim();
+    if (renderedPath) {
+      // A pre-rendered voice Short is supplied — skip download + re-encode and
+      // publish the already-final MP4. Only files in the controlled voice work
+      // dir (/tmp/clipflow-voice-*) are accepted.
+      if (!renderedPath.startsWith("/tmp/clipflow-voice-") || !renderedPath.endsWith(".mp4")) {
+        await Bun.$`rm -rf ${workDir}`.quiet().nothrow();
+        return {
+          success: false,
+          code: "API_ERROR",
+          error: "Invalid renderedPath: must be an .mp4 under /tmp/clipflow-voice-*.",
+        };
       }
+      if (!(await Bun.file(renderedPath).exists())) {
+        await Bun.$`rm -rf ${workDir}`.quiet().nothrow();
+        return {
+          success: false,
+          code: "DOWNLOAD_FAILED",
+          error: "The rendered Short file was not found on the server.",
+        };
+      }
+      shortPath = renderedPath;
+      console.log(`[ClipFlow] Using pre-rendered voice Short: ${renderedPath}`);
     } else {
-      console.log(
-        "[ClipFlow] No transcript segments for this clip — encoding without subtitles"
-      );
-    }
+          await Bun.$`mkdir -p ${workDir}`.quiet();
 
-    const encodeResult = await Bun.$`ffmpeg \
-      -ss ${clipStart} \
-      -i ${rawClipPath} \
-      -t ${clipDuration} \
-      -vf ${vfChain} \
-      -c:v libx264 -preset veryfast -crf 23 \
-      -c:a aac -b:a 128k \
-      -y \
-      ${shortPath}`
-      .quiet()
-      .nothrow();
+          // ── 4. Download source video (Supadata API primary, yt-dlp fallback) ──
+          console.log(`[ClipFlow] Downloading source video: ${input.videoUrl}`);
+          const download = await downloadSourceVideo(
+            input.videoUrl,
+            rawClipPath,
+            cookieHeader
+          );
+          if (!download.ok) {
+            // Clean up
+            await Bun.$`rm -rf ${workDir}`.quiet().nothrow();
+            return {
+              success: false,
+              code: "DOWNLOAD_FAILED",
+              error: download.error,
+            };
+          }
 
-    if (encodeResult.exitCode !== 0) {
-      await Bun.$`rm -rf ${workDir}`.quiet().nothrow();
-      return {
-        success: false,
-        code: "ENCODE_FAILED",
-        error: "Failed to encode video to vertical Shorts format.",
-      };
-    }
+          // ── 5. Cut the clip segment and re-encode to vertical 9:16 Shorts ──
+          // Both download paths produce the FULL source video in raw.mp4, so we
+          // cut the clip with ffmpeg input-seek -ss <start> -t <duration>.
+          const clipStart = input.startTime;
+          const clipDuration = Math.max(0.1, input.endTime - input.startTime);
+          console.log(
+            `[ClipFlow] Encoding to vertical 9:16 Shorts format (start=${clipStart}s, dur=${clipDuration}s)`
+          );
 
-    const shortFile = Bun.file(shortPath);
-    if (!(await shortFile.exists())) {
-      await Bun.$`rm -rf ${workDir}`.quiet().nothrow();
-      return {
-        success: false,
-        code: "ENCODE_FAILED",
-        error: "Encoding completed but the output file was not found.",
-      };
+          // Build the video filter chain. crop+scale first (1080×1920 canvas), then
+          // burn in ASS captions AFTER the scale so text is drawn in the final
+          // 1080×1920 coordinate space (large, readable, correctly positioned).
+          let vfChain = "crop=ih*9/16:ih,scale=1080:1920";
+
+          // Optional burned-in captions: use the transcript segments the client
+          // sent for this clip's time window. Missing/invalid/empty segments are
+          // handled gracefully — the clip encodes WITHOUT subtitles.
+          const captionSegments = normalizeCaptionSegments(input.segments);
+          if (captionSegments.length > 0) {
+            if (await assFilterAvailable()) {
+              const assPath = `${workDir}/clip.ass`;
+              const eventCount = await buildAssFile(
+                captionSegments,
+                clipStart,
+                clipDuration,
+                assPath
+              );
+              if (eventCount > 0) {
+                vfChain += `,ass=${assPath}`;
+                console.log(
+                  `[ClipFlow] Burning ${eventCount} caption events into Short (ass=${assPath})`
+                );
+              } else {
+                console.log(
+                  "[ClipFlow] No caption segments overlap the clip window — encoding without subtitles"
+                );
+              }
+            } else {
+              console.log(
+                "[ClipFlow] libass subtitles unavailable (no ass filter in ffmpeg) — encoding without subtitles"
+              );
+            }
+          } else {
+            console.log(
+              "[ClipFlow] No transcript segments for this clip — encoding without subtitles"
+            );
+          }
+
+          const encodeResult = await Bun.$`ffmpeg \
+            -ss ${clipStart} \
+            -i ${rawClipPath} \
+            -t ${clipDuration} \
+            -vf ${vfChain} \
+            -c:v libx264 -preset veryfast -crf 23 \
+            -c:a aac -b:a 128k \
+            -y \
+            ${shortPath}`
+            .quiet()
+            .nothrow();
+
+          if (encodeResult.exitCode !== 0) {
+            await Bun.$`rm -rf ${workDir}`.quiet().nothrow();
+            return {
+              success: false,
+              code: "ENCODE_FAILED",
+              error: "Failed to encode video to vertical Shorts format.",
+            };
+          }
+
+          const shortFile = Bun.file(shortPath);
+          if (!(await shortFile.exists())) {
+            await Bun.$`rm -rf ${workDir}`.quiet().nothrow();
+            return {
+              success: false,
+              code: "ENCODE_FAILED",
+              error: "Encoding completed but the output file was not found.",
+            };
+          }
+
     }
 
     // ── 6. Upload to the selected destination(s) ──
