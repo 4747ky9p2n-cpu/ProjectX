@@ -9,9 +9,11 @@
  * bot-blocked by YouTube):
  *   1. Piped public API (free, no key) — primary. The instance proxy serves
  *      a muxed mp4 that downloads reliably from this host.
- *   2. Supadata download API (free tier) — first fallback.
- *   3. yt-dlp — last resort, only when the Supadata API gave us a URL but the
- *      download from it failed (bot-blocked on this host, so rarely useful).
+ *   2. yt-dlp with the owner's browser cookies (YOUTUBE_COOKIES secret) —
+ *      strongest bypass, used only when the secret is set.
+ *   3. yt-dlp authenticated with the owner's YouTube OAuth bearer — used when
+ *      a connected-account token is present.
+ *   4. Supadata download API (free tier) — final fallback.
  *
  * Prerequisites (system):
  *   ffmpeg  — apt install ffmpeg (or equivalent)
@@ -806,12 +808,29 @@ export async function downloadSourceVideo(
   // ── Primary: Piped public API (free, no key) ──
   const piped = await downloadViaPiped(videoUrl, rawClipPath);
   if (piped.ok) return piped;
-  // Fallback 1 (new): Authenticated yt-dlp using the owner's YouTube OAuth.
-  // The free Piped network is near-dead and its lone live instance anonymously
-  // bot-blocks the owner's source videos (HTTP 500 SignInConfirmNotBotException).
-  // YouTube treats authenticated requests differently, so retry directly with
-  // the owner's OAuth access token (read from the youtube_auth request cookie),
-  // which bypasses the bot-check. Only attempted when a valid token exists.
+
+  // Fallback 1 (new): yt-dlp with the owner's browser cookies (YOUTUBE_COOKIES
+  // secret). The free Piped network is near-dead and its lone live instance
+  // anonymously bot-blocks the owner's source videos; full browser cookies are
+  // the strongest bypass (they carry the logged-in session YouTube trusts). Only
+  // attempted when the secret is set.
+  let botBlockedWithCookies = false;
+  if (youtubeCookiesSecret()) {
+    const cookies = await tryYtDlpCookies(videoUrl, rawClipPath);
+    if (cookies.ok) return cookies;
+    if (cookies.tried) {
+      console.error(
+        `[ClipFlow] yt-dlp cookies download failed: ${cookies.error}`
+      );
+      if (cookies.cause === "bot-blocked") botBlockedWithCookies = true;
+    }
+  }
+
+  // Fallback 2: Authenticated yt-dlp using the owner's YouTube OAuth. YouTube
+  // treats authenticated requests differently, so retry directly with the
+  // owner's OAuth access token (read from the youtube_auth request cookie),
+  // which can also bypass the bot-check. Only attempted when a valid token
+  // exists.
   let botBlockedWithAuth = false;
   const authenticated = await tryYtDlpAuthenticated(
     videoUrl,
@@ -826,7 +845,7 @@ export async function downloadSourceVideo(
     if (authenticated.cause === "bot-blocked") botBlockedWithAuth = true;
   }
 
-  // ── Fallback 2: Supadata download API ──
+  // ── Fallback 3: Supadata download API ──
   const res = await fetchSupadataDownload(videoUrl);
   if (res.ok) {
     try {
@@ -848,7 +867,8 @@ export async function downloadSourceVideo(
           );
           return finalOr(
             await downloadViaYtDlpFallback(videoUrl, rawClipPath),
-            botBlockedWithAuth
+            botBlockedWithAuth,
+            botBlockedWithCookies
           );
         }
         await downloadVideoBytes(downloadUrl, rawClipPath);
@@ -867,7 +887,8 @@ export async function downloadSourceVideo(
       }
       return finalOr(
         await downloadViaYtDlpFallback(videoUrl, rawClipPath),
-        botBlockedWithAuth
+        botBlockedWithAuth,
+        botBlockedWithCookies
       );
     } catch (err) {
       // The download URL fetch failed (network error, timeout, dead link).
@@ -875,7 +896,8 @@ export async function downloadSourceVideo(
       console.error("[ClipFlow] Supadata video download failed:", err);
       return finalOr(
         await downloadViaYtDlpFallback(videoUrl, rawClipPath),
-        botBlockedWithAuth
+        botBlockedWithAuth,
+        botBlockedWithCookies
       );
     }
   }
@@ -890,28 +912,47 @@ export async function downloadSourceVideo(
   if (res.kind === "limit" || res.kind === "4xx") {
     return {
       ok: false,
-      error: composeFinalDownloadError(res.error, botBlockedWithAuth),
+      error: composeFinalDownloadError(
+        res.error,
+        botBlockedWithAuth,
+        botBlockedWithCookies
+      ),
     };
   }
   // 5xx / network failure: try the yt-dlp fallback as a last resort.
   return finalOr(
     await downloadViaYtDlpFallback(videoUrl, rawClipPath),
-    botBlockedWithAuth
+    botBlockedWithAuth,
+    botBlockedWithCookies
   );
 }
 
 /**
  * Compose a clear, actionable download error once every fallback has failed.
- * When the connected-account yt-dlp attempt was itself blocked by YouTube's
- * anti-bot/membership wall, the owner needs to know the actual fix (full
- * browser cookies for yt-dlp, and/or a Supadata upgrade). Otherwise we pass
- * the underlying error through unchanged so distinct cases keep distinct
- * messages.
+ * When the yt-dlp-with-cookies attempt was itself bot-blocked by YouTube, the
+ * owner must refresh the YOUTUBE_COOKIES secret with a freshly exported
+ * cookies.txt (their cookies expired or were invalidated). When the
+ * connected-account (OAuth) yt-dlp attempt was itself blocked, the owner needs
+ * to know the actual fix (full browser cookies for yt-dlp, and/or a Supadata
+ * upgrade). Otherwise we pass the underlying error through unchanged so
+ * distinct cases keep distinct messages.
  */
 export function composeFinalDownloadError(
   lastError: string,
-  botBlockedWithAuth: boolean
+  botBlockedWithAuth: boolean,
+  botBlockedWithCookies = false
 ): string {
+  if (botBlockedWithCookies) {
+    return (
+      "Could not download this video: even with the owner's browser cookies " +
+      "YouTube still blocks the download (anti-bot wall), and the free " +
+      "Piped/Supadata fallbacks also failed. The YOUTUBE_COOKIES secret must be " +
+      "refreshed: log into youtube.com in a fresh browser session, export a new " +
+      "cookies.txt (including ALL important cookies such as SID, SSID and HSID), " +
+      "and set it as the YOUTUBE_COOKIES secret. " +
+      `[underlying: ${lastError}]`
+    );
+  }
   if (!botBlockedWithAuth) return lastError;
   return (
     "Could not download this video: even with your connected YouTube account, " +
@@ -926,12 +967,17 @@ export function composeFinalDownloadError(
 /** Wrap a DownloadOutcome, replacing only the failure message with the composed one. */
 function finalOr(
   outcome: DownloadOutcome,
-  botBlockedWithAuth: boolean
+  botBlockedWithAuth: boolean,
+  botBlockedWithCookies = false
 ): DownloadOutcome {
   if (outcome.ok) return outcome;
   return {
     ok: false,
-    error: composeFinalDownloadError(outcome.error, botBlockedWithAuth),
+    error: composeFinalDownloadError(
+      outcome.error,
+      botBlockedWithAuth,
+      botBlockedWithCookies
+    ),
   };
 }
 
@@ -1208,6 +1254,157 @@ export async function tryYtDlpAuthenticated(
     auth.accessToken
   );
   return { ...outcome, tried: true };
+}
+
+/**
+ * Read the YOUTUBE_COOKIES secret through the same environment mechanism the
+ * app uses for its other YOUTUBE_/GOOGLE_ secrets (compare GOOGLE_CLIENT_SECRET
+ * and SUPADATA_API_KEY, both `process.env.X || fallback`). The value is a
+ * Netscape `cookies.txt` document. Returns null when unset so callers simply
+ * skip the cookies path. The secret itself is NEVER logged or placed on a
+ * process command line — only written to a transient, permission-protected
+ * file that is referenced by path via --cookies.
+ */
+export function youtubeCookiesSecret(): string | null {
+  const raw = process.env.YOUTUBE_COOKIES;
+  if (!raw || !raw.trim()) return null;
+  return raw;
+}
+
+/** Contents of the YOUTUBE_COOKIES secret for cookie writes. */
+async function cookiesSecretOrNull(): Promise<string | null> {
+  return youtubeCookiesSecret();
+}
+
+/**
+ * Write the cookie secret to a transient, permission-protected file under
+ * /tmp/clipflow-cookies-* and return its path. The file is removed by the
+ * caller in a finally block once the download attempt finishes.
+ */
+export async function writeCookiesFile(cookiesValue: string): Promise<string> {
+  const path = `/tmp/clipflow-cookies-${Math.random().toString(36).slice(2)}`;
+  await Bun.write(path, cookiesValue);
+  await Bun.$`chmod 600 ${path}`.quiet().nothrow();
+  return path;
+}
+
+/**
+ * yt-dlp download with the owner's full browser cookies (YOUTUBE_COOKIES
+ * secret). This is the strongest bypass for YouTube's "Sign in to confirm
+ * you're not a bot" wall: the cookies carry a logged-in session YouTube trusts,
+ * unlike the OAuth bearer token alone. The cookie contents are written to a
+ * transient file and referenced via --cookies <path> so the secret never
+ * appears on the command line or in logs.
+ *
+ * Returns `tried: false` when the secret is unset (caller skips straight on);
+ * `tried: true` once a real cookies-based attempt has been made.
+ */
+export async function tryYtDlpCookies(
+  videoUrl: string,
+  rawClipPath: string
+): Promise<DownloadOutcome & { tried: boolean }> {
+  const cookies = await cookiesSecretOrNull();
+  if (!cookies) {
+    return {
+      ok: false,
+      error: "No YOUTUBE_COOKIES secret set.",
+      tried: false,
+    };
+  }
+  let cookiesPath: string | null = null;
+  try {
+    cookiesPath = await writeCookiesFile(cookies);
+    console.log(
+      "[ClipFlow] Piped failed; retrying download via yt-dlp with --cookies (YOUTUBE_COOKIES)."
+    );
+    const outcome = await downloadViaYtDlpWithCookies(
+      videoUrl,
+      rawClipPath,
+      cookiesPath
+    );
+    return { ...outcome, tried: true };
+  } finally {
+    if (cookiesPath) {
+      await Bun.$`rm -f ${cookiesPath}`.quiet().nothrow();
+    }
+  }
+}
+
+/**
+ * yt-dlp download of the full video (best <=1080p) to rawClipPath using a
+ * cookies.txt file at `cookiesPath` (passed as --cookies <path>). The path is
+ * the only thing exposed to yt-dlp; the cookie contents never touch argv or
+ * logs, and --quiet keeps yt-dlp's own output minimal.
+ */
+export async function downloadViaYtDlpWithCookies(
+  videoUrl: string,
+  rawClipPath: string,
+  cookiesPath: string
+): Promise<DownloadOutcome> {
+  try {
+    // Pass --quiet and --cookies <path> as SEPARATE interpolated argv elements
+    // (the same pattern downloadViaYtDlpFallback uses for --add-header). This
+    // keeps each flag its own argv element so it is detectable and, in a real
+    // exec, split cleanly. Only the path is exposed on argv; never the cookie
+    // contents.
+    const quietArg = ["--quiet"];
+    const cookieArgs = ["--cookies", cookiesPath];
+    const dlResult = await Bun.$`yt-dlp \
+      -f "best[height<=1080]" \
+      -o ${rawClipPath} \
+      --no-playlist \
+      --no-warnings \
+      ${quietArg} \
+      ${cookieArgs} \
+      ${videoUrl}`
+      .quiet()
+      .nothrow();
+    if (dlResult.exitCode !== 0) {
+      const stderr = (
+        dlResult.stderr?.toString?.() ?? String(dlResult.stderr ?? "")
+      ).toLowerCase();
+      if (stderr.includes("sign in to confirm")) {
+        return {
+          ok: false,
+          cause: "bot-blocked",
+          error:
+            "Download failed even with the owner's browser cookies — YouTube still enforced a sign-in/anti-bot wall. The YOUTUBE_COOKIES secret must be refreshed with a fresh cookies.txt exported right after logging into youtube.com (include all important cookies such as SID, SSID and HSID).",
+        };
+      }
+      if (
+        stderr.includes("members-only") ||
+        stderr.includes("private video")
+      ) {
+        return {
+          ok: false,
+          cause: "members-only",
+          error:
+            "This video is members-only/private and cannot be downloaded even with the owner's browser cookies.",
+        };
+      }
+      return {
+        ok: false,
+        error:
+          "Download failed even with the owner's browser cookies (yt-dlp exited non-zero).",
+      };
+    }
+    const file = Bun.file(rawClipPath);
+    if (!(await file.exists()) || file.size === 0) {
+      return {
+        ok: false,
+        error: "Download completed but the output file was not found.",
+      };
+    }
+    return { ok: true };
+  } catch (err) {
+    return {
+      ok: false,
+      error:
+        err instanceof Error
+          ? err.message
+          : "Failed to download the video (yt-dlp cookies fallback error).",
+    };
+  }
 }
 /** yt-dlp download of the full video (best <=1080p) to rawClipPath.
  *  When `authBearer` is provided, the owner's YouTube OAuth access token is
